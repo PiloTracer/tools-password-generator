@@ -144,7 +144,7 @@ export function PasswordGeneratorForm() {
       <header className="flex flex-wrap items-center justify-between gap-6">
         <div>
           <h1 className="text-3xl font-semibold text-zinc-900 dark:text-zinc-50">
-            Secure Password Generator
+            Secure Password Generator by AI Epic Studio
           </h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-600 dark:text-zinc-400">
             Generate strong passwords or memorable passphrases using audited server-side

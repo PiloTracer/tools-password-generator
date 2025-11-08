@@ -10,6 +10,19 @@ export default function Home() {
       <main className="relative mx-auto flex min-h-screen w-full max-w-6xl items-center justify-center px-6 py-16 sm:px-10 lg:px-16">
         <PasswordGeneratorForm />
       </main>
+      <footer className="relative z-10 flex flex-col items-center gap-2 pb-10 text-sm text-zinc-600 dark:text-zinc-400">
+        <a
+          href="https://github.com/AIEpicStudio/password-tools"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="font-medium text-indigo-600 transition hover:text-indigo-500 dark:text-indigo-300 dark:hover:text-indigo-200"
+        >
+          View source on GitHub
+        </a>
+        <p className="text-center text-xs">
+          © {new Date().getFullYear()} Alejandro Castro &amp; AIEpicStudio.com. All rights reserved.
+        </p>
+      </footer>
     </div>
   );
 }

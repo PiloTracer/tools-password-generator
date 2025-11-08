@@ -90,3 +90,7 @@ Both images install Python 3 so the API route can execute `password_generator.py
 - If you update the word list, rebuild Docker images to pick up the new file.
 
 Enjoy generating secure passwords! 🎯
+
+## 5. License
+
+Distributed under the MIT License. See `LICENSE` for details. Retain attribution to Alejandro Castro and AIEpicStudio.com in all copies or substantial portions of the software.
