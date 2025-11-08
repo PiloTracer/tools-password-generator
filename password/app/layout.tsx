@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Secure Password Generator by AIEpicStudio.com",
+  title: "Secure Password Generator by AIEpicStudio.com/AIEpic.app",
   description:
     "Generate strong passwords and passphrases securely using server-side entropy.",
 };

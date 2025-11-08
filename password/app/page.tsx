@@ -20,7 +20,7 @@ export default function Home() {
           View source on GitHub
         </a>
         <p className="text-center text-xs">
-          © {new Date().getFullYear()} Alejandro Castro &amp; AIEpicStudio.com. All rights reserved.
+          © {new Date().getFullYear()} Alejandro Castro &amp; AIEpicStudio.com &amp; AIEpic.app. All rights reserved.
         </p>
       </footer>
     </div>

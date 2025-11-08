@@ -93,4 +93,4 @@ Enjoy generating secure passwords! 🎯
 
 ## 5. License
 
-Distributed under the MIT License. See `LICENSE` for details. Retain attribution to Alejandro Castro and AIEpicStudio.com in all copies or substantial portions of the software.
+Distributed under the MIT License. See `LICENSE` for details. Retain attribution to Alejandro Castro and AIEpicStudio.com and AIEpic.app in all copies or substantial portions of the software.
