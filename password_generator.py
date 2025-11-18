@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 SPECIAL_CHARACTERS = "$%^@!&*"
+AMBIGUOUS_CHARACTERS = "l1IO0"
 
 # Fallback words used only if no external word list is available.
 DEFAULT_INLINE_WORDS: List[str] = """
@@ -63,6 +64,7 @@ class Configuration:
     passphrase_mixed_count: int
     randomize_word_capitalization: bool
     wordlist_path: Optional[Path]
+    exclude_ambiguous: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -161,6 +163,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--non-interactive",
         action="store_true",
         help="Skip interactive prompts and rely solely on the provided flags.",
+    )
+    parser.add_argument(
+        "--exclude-ambiguous",
+        action="store_true",
+        help="Exclude easily confused characters (e.g. 'l', '1', 'I', 'O', '0').",
     )
     return parser
 
@@ -314,6 +321,13 @@ def gather_configuration(args: argparse.Namespace) -> Configuration:
         should_prompt=interactive and use_words,
     )
 
+    exclude_ambiguous = resolve_bool(
+        args.exclude_ambiguous,
+        "Exclude ambiguous characters (e.g. 'l', '1', 'O', '0')",
+        False,
+        should_prompt=interactive,
+    )
+
     return Configuration(
         use_words=use_words,
         length=length,
@@ -327,6 +341,7 @@ def gather_configuration(args: argparse.Namespace) -> Configuration:
         passphrase_mixed_count=passphrase_mixed_count,
         randomize_word_capitalization=randomize_word_capitalization,
         wordlist_path=args.wordlist,
+        exclude_ambiguous=exclude_ambiguous,
     )
 
 
@@ -345,26 +360,43 @@ def ensure_length_valid(
         )
 
 
-def random_mixed_case_letter(rng: secrets.SystemRandom) -> str:
-    letter = rng.choice(string.ascii_lowercase)
-    if rng.choice([True, False]):
-        return letter.upper()
-    return letter
+def get_pool(base_pool: str, exclude_ambiguous: bool) -> str:
+    if not exclude_ambiguous:
+        return base_pool
+    return "".join(c for c in base_pool if c not in AMBIGUOUS_CHARACTERS)
+
+
+def get_random_mixed_char(rng: secrets.SystemRandom, exclude_ambiguous: bool) -> str:
+    pool = get_pool(string.ascii_letters, exclude_ambiguous)
+    if not pool:
+        # Fallback if all are excluded (unlikely)
+        return rng.choice(string.ascii_letters)
+    return rng.choice(pool)
 
 
 def generate_character_password(
-    length: int, special_count: int, digit_count: int, mixed_case_count: int
+    length: int,
+    special_count: int,
+    digit_count: int,
+    mixed_case_count: int,
+    exclude_ambiguous: bool,
 ) -> str:
     ensure_length_valid(length, special_count, digit_count, mixed_case_count)
     rng = secrets.SystemRandom()
     password_chars: List[str] = []
 
-    password_chars.extend(rng.choice(SPECIAL_CHARACTERS) for _ in range(special_count))
-    password_chars.extend(rng.choice(string.digits) for _ in range(digit_count))
-    password_chars.extend(random_mixed_case_letter(rng) for _ in range(mixed_case_count))
+    specials_pool = get_pool(SPECIAL_CHARACTERS, exclude_ambiguous)
+    digits_pool = get_pool(string.digits, exclude_ambiguous)
+    lowercase_pool = get_pool(string.ascii_lowercase, exclude_ambiguous)
+
+    password_chars.extend(rng.choice(specials_pool) for _ in range(special_count))
+    password_chars.extend(rng.choice(digits_pool) for _ in range(digit_count))
+    password_chars.extend(
+        get_random_mixed_char(rng, exclude_ambiguous) for _ in range(mixed_case_count)
+    )
 
     remaining = length - len(password_chars)
-    password_chars.extend(rng.choice(string.ascii_lowercase) for _ in range(remaining))
+    password_chars.extend(rng.choice(lowercase_pool) for _ in range(remaining))
 
     rng.shuffle(password_chars)
     return "".join(password_chars)
@@ -395,12 +427,25 @@ def load_wordlist(path: Optional[Path]) -> List[str]:
     return list(DEFAULT_INLINE_WORDS)
 
 
-def randomize_word(word: str, rng: secrets.SystemRandom, randomize: bool) -> str:
+def randomize_word(
+    word: str, rng: secrets.SystemRandom, randomize: bool, exclude_ambiguous: bool
+) -> str:
     base = word.lower()
     if not randomize:
         return base
+    
     letters = list(base)
-    index = rng.randrange(len(letters))
+    valid_indices = []
+    for i, char in enumerate(letters):
+        if exclude_ambiguous:
+            if char.upper() in AMBIGUOUS_CHARACTERS:
+                continue
+        valid_indices.append(i)
+    
+    if not valid_indices:
+        return base
+
+    index = rng.choice(valid_indices)
     letters[index] = letters[index].upper()
     return "".join(letters)
 
@@ -414,6 +459,7 @@ def generate_passphrase(
     special_count: int,
     mixed_count: int,
     randomize_word_capitalization: bool,
+    exclude_ambiguous: bool,
 ) -> str:
     if not words:
         raise ValueError("Word list is empty; provide a valid word list.")
@@ -422,7 +468,11 @@ def generate_passphrase(
     selected_words: List[str] = []
     for _ in range(word_count):
         word = rng.choice(words)
-        selected_words.append(randomize_word(word, rng, randomize_word_capitalization))
+        selected_words.append(
+            randomize_word(
+                word, rng, randomize_word_capitalization, exclude_ambiguous
+            )
+        )
 
     if separator:
         base = separator.join(selected_words)
@@ -430,12 +480,22 @@ def generate_passphrase(
         base = "".join(selected_words)
 
     suffix_parts: List[str] = []
+    
+    digits_pool = get_pool(string.digits, exclude_ambiguous)
+    specials_pool = get_pool(SPECIAL_CHARACTERS, exclude_ambiguous)
+
     if digit_count > 0:
-        suffix_parts.append("".join(rng.choice(string.digits) for _ in range(digit_count)))
+        suffix_parts.append(
+            "".join(rng.choice(digits_pool) for _ in range(digit_count))
+        )
     if special_count > 0:
-        suffix_parts.append("".join(rng.choice(SPECIAL_CHARACTERS) for _ in range(special_count)))
+        suffix_parts.append(
+            "".join(rng.choice(specials_pool) for _ in range(special_count))
+        )
     if mixed_count > 0:
-        suffix_parts.append("".join(random_mixed_case_letter(rng) for _ in range(mixed_count)))
+        suffix_parts.append(
+            "".join(get_random_mixed_char(rng, exclude_ambiguous) for _ in range(mixed_count))
+        )
 
     if not suffix_parts:
         return base
@@ -453,7 +513,10 @@ def main() -> None:
         config = gather_configuration(args)
         if not config.use_words:
             ensure_length_valid(
-                config.length, config.special_count, config.digit_count, config.mixed_case_count
+                config.length,
+                config.special_count,
+                config.digit_count,
+                config.mixed_case_count,
             )
     except KeyboardInterrupt:
         print("\nAborted.")
@@ -464,6 +527,7 @@ def main() -> None:
 
     print("\nPassword configuration:")
     print(f"  Use words: {'Yes' if config.use_words else 'No'}")
+    print(f"  Exclude ambiguous: {'Yes' if config.exclude_ambiguous else 'No'}")
     if config.use_words:
         print(f"  Word count: {config.word_count}")
         print(f"  Separator: '{config.word_separator}'")
@@ -491,10 +555,15 @@ def main() -> None:
             special_count=config.passphrase_special_count,
             mixed_count=config.passphrase_mixed_count,
             randomize_word_capitalization=config.randomize_word_capitalization,
+            exclude_ambiguous=config.exclude_ambiguous,
         )
     else:
         password = generate_character_password(
-            config.length, config.special_count, config.digit_count, config.mixed_case_count
+            config.length,
+            config.special_count,
+            config.digit_count,
+            config.mixed_case_count,
+            config.exclude_ambiguous,
         )
 
     print("\nGenerated password:\n")
