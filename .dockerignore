@@ -1,0 +1,16 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile*
+docker-compose*
+README.md
+LICENSE
+node_modules
+npm-debug.log
+__pycache__
+*.pyc
+.env
+.env.local
+.DS_Store
+password/node_modules
+password/.next
