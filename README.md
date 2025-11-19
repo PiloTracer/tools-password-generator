@@ -25,16 +25,63 @@ python password_generator.py --help   # Full option list
   - `--passphrase-special-count`
   - `--passphrase-mixed-count`
   - `--randomize-word-case` or `--no-randomize-word-case`
-- `--wordlist <path>`  
+- `--wordlist <path>`
   Supply a custom word list (one word per line).
-- `--non-interactive`  
+- `--exclude-ambiguous`
+  Exclude easily confused characters (e.g., 'l', '1', 'I', 'O', '0').
+- `--non-interactive`
   Skip prompts—useful for automation.
 
 All randomness comes from `secrets.SystemRandom`, ensuring cryptographically strong output. Invalid combinations (for example, requesting more required characters than total length) fail fast with clear messages.
 
 ## 2. Web Application (`password/`)
 
-The Next.js 16 app delivers the same functionality through a UI. The form posts to `/api/generate`, which spawns `password_generator.py` on the server and returns the generated password.
+The Next.js 16 app delivers the same functionality through a modern, responsive UI with additional features for enhanced usability and security.
+
+### Features
+
+- **Two Generation Modes**
+  - **Character Mode**: Generate traditional random passwords with customizable length and character requirements
+  - **Passphrase Mode**: Generate memorable passphrases using word lists (EFF Diceware)
+
+- **Password Strength Meter**
+  - Real-time strength analysis using the zxcvbn library
+  - Visual feedback with color-coded strength indicator (Very Weak to Very Strong)
+  - Helpful warnings and suggestions for weak passwords
+
+- **Exclude Ambiguous Characters**
+  - Toggle to avoid confusing characters like 'l', '1', 'I', 'O', '0'
+  - Works in both character and passphrase modes
+
+- **Password History**
+  - Automatically saves your last 10 generated passwords (in-memory only, cleared on page refresh)
+  - Quick access to previously generated passwords
+  - One-click copy from history
+
+- **QR Code Generation**
+  - Generate QR codes for your passwords
+  - Useful for transferring passwords to mobile devices securely
+
+- **Export & Copy**
+  - One-click copy to clipboard
+  - Download password as a text file
+  - Visual confirmation when copied
+
+- **Dark Mode Support**
+  - Automatic theme detection
+  - Smooth transitions between light and dark modes
+  - Optimized for readability in both themes
+
+- **Responsive Design**
+  - Mobile-friendly interface
+  - Touch-optimized controls
+  - Works seamlessly on all screen sizes
+
+- **Privacy & Security**
+  - All password generation happens server-side using cryptographically secure randomness
+  - No data is stored anywhere (no databases, no logs, no analytics)
+  - Passwords are generated on-demand and never persisted
+  - History is kept only in browser memory and cleared on page refresh
 
 ### Local Development
 
