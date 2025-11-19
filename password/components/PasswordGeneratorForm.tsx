@@ -90,23 +90,6 @@ export function PasswordGeneratorForm() {
   const [showHistory, setShowHistory] = useState(false);
   const [showQR, setShowQR] = useState(false);
 
-  // Load history from session storage
-  useEffect(() => {
-    const stored = sessionStorage.getItem("passwordHistory");
-    if (stored) {
-      try {
-        setPasswordHistory(JSON.parse(stored));
-      } catch {
-        // ignore
-      }
-    }
-  }, []);
-
-  // Save history to session storage
-  useEffect(() => {
-    sessionStorage.setItem("passwordHistory", JSON.stringify(passwordHistory));
-  }, [passwordHistory]);
-
   const strength = useMemo(() => {
     if (!generatedPassword) return null;
     return zxcvbn(generatedPassword);
@@ -651,7 +634,15 @@ export function PasswordGeneratorForm() {
           https://github.com/PiloTracer/tools-password-generator
         </a>
         <div className="mt-2 text-zinc-400 dark:text-zinc-500">
-          &copy; 2025 Epic Studio
+          &copy; 2025{" "}
+          <a
+            href="https://aiepicstudio.com"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+          >
+            AI Epic Studio
+          </a>
         </div>
       </div>
     </div>
