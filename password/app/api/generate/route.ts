@@ -10,6 +10,7 @@ type CharacterPayload = {
   specialCount?: number;
   digitCount?: number;
   mixedCaseCount?: number;
+  excludeAmbiguous?: boolean;
 };
 
 type PassphrasePayload = {
@@ -20,6 +21,7 @@ type PassphrasePayload = {
   passphraseSpecialCount?: number;
   passphraseMixedCount?: number;
   randomizeWordCapitalization?: boolean;
+  excludeAmbiguous?: boolean;
 };
 
 type Payload = (CharacterPayload | PassphrasePayload) & {
@@ -142,6 +144,12 @@ export async function POST(request: NextRequest) {
 
   const mode = payload.mode === "words" ? "words" : "characters";
   const args: string[] = [];
+
+  // Common flag
+  const excludeAmbiguous = sanitizeBoolean(payload.excludeAmbiguous, false);
+  if (excludeAmbiguous) {
+    args.push("--exclude-ambiguous");
+  }
 
   if (mode === "characters") {
     const characterPayload = payload as CharacterPayload;

@@ -1,26 +1,36 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --foreground-rgb: 0, 0, 0;
+  --background-start-rgb: 214, 219, 220;
+  --background-end-rgb: 255, 255, 255;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --foreground-rgb: 255, 255, 255;
+    --background-start-rgb: 0, 0, 0;
+    --background-end-rgb: 0, 0, 0;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer base {
+  body {
+    @apply bg-gradient-to-br from-indigo-100 via-purple-50 to-pink-100 text-zinc-900 antialiased transition-colors dark:from-zinc-900 dark:via-zinc-900 dark:to-zinc-950 dark:text-zinc-100;
+    min-height: 100vh;
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply border border-white/20 bg-white/70 backdrop-blur-xl dark:border-white/10 dark:bg-zinc-900/60;
+  }
+
+  .glass-card {
+    @apply rounded-3xl border border-white/40 bg-white/60 shadow-xl backdrop-blur-md dark:border-white/5 dark:bg-zinc-900/60;
+  }
+
+  .glass-input {
+    @apply border-zinc-200/50 bg-white/50 focus:border-indigo-500/50 focus:bg-white/80 dark:border-zinc-700/50 dark:bg-zinc-800/50 dark:focus:border-indigo-400/50 dark:focus:bg-zinc-800/80;
+  }
 }
