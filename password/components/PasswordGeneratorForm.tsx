@@ -751,7 +751,7 @@ function ToggleInput({ label, description, checked, onChange }: ToggleInputProps
         >
           <span
             className={cn(
-              "absolute top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-white shadow-sm transition-transform duration-300",
+              "absolute left-0 top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-white shadow-sm transition-transform duration-300",
               checked ? "translate-x-6" : "translate-x-1"
             )}
           />
