@@ -639,6 +639,21 @@ export function PasswordGeneratorForm() {
           </motion.div>
         ) : null}
       </form>
+
+      <div className="mt-8 text-center text-xs text-zinc-500 dark:text-zinc-400">
+        Latest code is available free at:{" "}
+        <a
+          href="https://github.com/PiloTracer/tools-password-generator"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+        >
+          https://github.com/PiloTracer/tools-password-generator
+        </a>
+        <div className="mt-2 text-zinc-400 dark:text-zinc-500">
+          &copy; 2025 Epic Studio
+        </div>
+      </div>
     </div>
   );
 }
