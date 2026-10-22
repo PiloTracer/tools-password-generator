@@ -146,8 +146,11 @@ Commands:
   restore <path>       Restore a bundle (.tar.gz) or staging directory
   backups <sub>        list | verify | prune
   cleanup <scope>      containers | volumes | images | backups | all | dangling
+  credentials [client] [--json]
+                       Show scoped client credentials for the current env
   secrets <sub>        list | get | put | create | describe | delete |
-                       seed | test | verify | endpoint | random | raw
+                       seed | test | verify | endpoint | random | raw |
+                       credentials [client] [--json]
   shell [service]      Shell in app (default) or secrets-manager
   exec <cmd...>        Run a command in the app container
   test-cli             Test password_generator.py (host or container)
@@ -178,6 +181,8 @@ Examples:
   ./bin/start.sh backup prd --retention 10
   ./bin/start.sh restore prd backups/prd/backup-prd-20250101T000000Z.tar.gz
   ./bin/start.sh secrets prd test
+  ./bin/start.sh secrets prd credentials acb
+  ./bin/start.sh credentials prd acb --json
   ./bin/start.sh secrets dev verify --sdk --boto3
   ./bin/start.sh check-env
   ./bin/start.sh cleanup dev volumes --yes
@@ -381,7 +386,7 @@ resolve_env() {
     PUBLIC_HTTPS_PORT SECRETS_MANAGER_BIND_ADDRESS SECRETS_MANAGER_PORT SECRETS_MANAGER_REGION \
     SECRETS_MANAGER_ACCOUNT_ID SECRETS_MANAGER_ACCESS_KEY_ID \
     SECRETS_MANAGER_SECRET_ACCESS_KEY SECRETS_MANAGER_SESSION_TOKEN \
-    SECRETS_MANAGER_MASTER_KEY SECRETS_MANAGER_ENABLED SECRETS_MANAGER_ENDPOINT \
+    SECRETS_MANAGER_MASTER_KEY SM_CLIENTS_JSON SECRETS_MANAGER_ENABLED SECRETS_MANAGER_ENDPOINT \
     APP_CONFIG_SECRET_ID INTEGRITY_SECRET_ID SECRETS_CACHE_TTL_MS \
     PASSWORD_GENERATOR_SCRIPT WORDLIST_PATH PYTHON_BIN LOG_LEVEL TZ \
     BACKUP_TAR_IMAGE BACKUP_RETENTION APP_VERSION; do
@@ -2002,6 +2007,9 @@ action_secrets_endpoint() {
     export AWS_ACCESS_KEY_ID=<value from $(basename "$ENV_FILE")>
     export AWS_SECRET_ACCESS_KEY=<value from $(basename "$ENV_FILE")>
     export AWS_REGION=$SECRETS_MANAGER_REGION
+
+  Scoped client credentials (ACB):
+    ./bin/start.sh credentials $APP_ENV_RESOLVED acb
 EOF
 }
 
@@ -2022,6 +2030,73 @@ action_secrets_raw() {
   fi
   require_sm_running || return 1
   sm_cli raw "$operation" "$payload"
+}
+
+# Print the selected client's SigV4 credentials. This intentionally writes the
+# secret to stdout; it never writes to a log file.
+action_client_credentials() {
+  local client="${1:-acb}" json="${2:-false}" endpoint=""
+  if [ -z "${SM_CLIENTS_JSON:-}" ]; then
+    err "No SM_CLIENTS_JSON in $(basename "$ENV_FILE"). Add the client credential first."
+    return 1
+  fi
+  if ! has python3; then
+    err "python3 is required to read SM_CLIENTS_JSON."
+    return 1
+  fi
+
+  if [ "$APP_ENV_RESOLVED" = "prd" ]; then
+    endpoint="${SECRETS_MANAGER_PUBLIC_URL:-https://$SECRETS_MANAGER_HOST}"
+  else
+    endpoint="http://${SECRETS_MANAGER_BIND_ADDRESS:-127.0.0.1}:${SECRETS_MANAGER_PORT:-18001}"
+  fi
+
+  warn "The following output contains a secret. Do not paste it into logs, tickets or chat."
+  python3 - "$SM_CLIENTS_JSON" "$client" "$json" "$endpoint" "$SECRETS_MANAGER_REGION" <<'PYCLIENT'
+import json
+import sys
+
+raw, wanted, mode, endpoint, region = sys.argv[1:6]
+try:
+    entries = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(f"SM_CLIENTS_JSON is not valid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(entries, list):
+    print("SM_CLIENTS_JSON must be a JSON array.", file=sys.stderr)
+    sys.exit(1)
+
+names = [str(entry.get("name") or entry.get("accessKeyId") or "?") for entry in entries if isinstance(entry, dict)]
+entry = next(
+    (
+        item
+        for item in entries
+        if isinstance(item, dict)
+        and (str(item.get("name", "")) == wanted or str(item.get("accessKeyId", "")) == wanted)
+    ),
+    None,
+)
+if entry is None:
+    print(f"Client '{wanted}' not found. Available: {', '.join(names) or '(none)'}", file=sys.stderr)
+    sys.exit(2)
+
+if not entry.get("accessKeyId") or not entry.get("secretAccessKey"):
+    print(f"Client '{wanted}' is missing accessKeyId or secretAccessKey.", file=sys.stderr)
+    sys.exit(1)
+
+values = {
+    "ACB_SECRETS_AWS_ACCESS_KEY_ID": str(entry["accessKeyId"]),
+    "ACB_SECRETS_AWS_SECRET_ACCESS_KEY": str(entry["secretAccessKey"]),
+    "ACB_SECRETS_AWS_SESSION_TOKEN": str(entry.get("sessionToken") or ""),
+    "ACB_SECRETS_AWS_ENDPOINT_URL": endpoint,
+    "ACB_SECRETS_AWS_REGION": region,
+}
+if mode == "true":
+    print(json.dumps(values))
+else:
+    for key, value in values.items():
+        print(f"{key}={value}")
+PYCLIENT
 }
 
 # ---------------------------------------------------------------------------
@@ -2385,7 +2460,7 @@ EOF
 }
 
 menu_secrets() {
-  local choice secret_id description file length sdk_choice boto3_choice with_sdk with_boto3
+  local choice secret_id description file length sdk_choice boto3_choice with_sdk with_boto3 client
   cat <<'EOF'
 
 Secrets Manager:
@@ -2400,6 +2475,7 @@ Secrets Manager:
   9) Show endpoint information
  10) Generate a random password
  11) Full AWS-substitute verification (lifecycle + optional AWS SDKs)
+ 12) Show client credentials (ACB / scoped SigV4)
   0) Back
 EOF
   printf 'Select: '
@@ -2452,6 +2528,11 @@ EOF
       read -r boto3_choice || boto3_choice=""
       case "$boto3_choice" in y|Y|yes) with_boto3=true ;; esac
       action_secrets_verify "$with_sdk" "$with_boto3"
+      ;;
+    12)
+      printf 'Client name [acb]: '
+      read -r client || return 0
+      action_client_credentials "${client:-acb}"
       ;;
     0|"") return 0 ;;
     *) warn "Invalid option." ;;
@@ -2757,6 +2838,19 @@ cmd_secrets() {
       seed_secrets "$force"
       ;;
     test) action_secrets_test ;;
+    credentials|client-credentials)
+      local client="acb" json=false
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --json) json=true ;;
+          --client) client="${2:-acb}"; shift ;;
+          --client=*) client="${1#--client=}" ;;
+          *) client="$1" ;;
+        esac
+        shift
+      done
+      action_client_credentials "$client" "$json"
+      ;;
     verify)
       local with_sdk=false with_boto3=false
       while [ "$#" -gt 0 ]; do
@@ -2789,6 +2883,20 @@ cmd_secrets() {
     help|--help|-h|"") usage; return 0 ;;
     *) err "Unknown secrets command: $sub"; return 1 ;;
   esac
+}
+
+cmd_client_credentials() {
+  local client="acb" json=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=true ;;
+      --client) client="${2:-acb}"; shift ;;
+      --client=*) client="${1#--client=}" ;;
+      *) client="$1" ;;
+    esac
+    shift
+  done
+  action_client_credentials "$client" "$json"
 }
 
 cmd_shell() {
@@ -2840,7 +2948,7 @@ main() {
       printf '%s %s\n' "$(basename "$0")" "$VERSION"
       return 0
       ;;
-    ""|menu|up|start|down|stop|restart|recreate|rebuild|status|logs|health|smoke|backup|restore|backups|cleanup|secrets|shell|exec|test-cli|config|check-env|doctor)
+    ""|menu|up|start|down|stop|restart|recreate|rebuild|status|logs|health|smoke|backup|restore|backups|cleanup|secrets|credentials|client-credentials|shell|exec|test-cli|config|check-env|doctor)
       ;;
     *)
       err "Unknown command: $command"
@@ -2903,6 +3011,10 @@ main() {
     secrets)
       shift
       cmd_secrets "$@"
+      ;;
+    credentials|client-credentials)
+      shift
+      cmd_client_credentials "$@"
       ;;
     shell)
       shift

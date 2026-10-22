@@ -200,6 +200,17 @@ Use a distinct access key and secret for dev and prd. The ACB client also needs
 the endpoint (`https://secrets.agiolab.com` in prd) and `us-east-1`; its session
 token is empty because this service does not issue temporary STS credentials.
 
+On the server, print the selected client credential from the current `.env`:
+
+```bash
+./bin/start.sh credentials prd acb
+# or, from the menu: Secrets Manager -> Show client credentials
+```
+
+The command reads `SM_CLIENTS_JSON`, does not need the container running, and
+prints the three ACB variables plus the endpoint and region. Treat its output as
+a secret and deliver it out of band.
+
 ---
 
 ## 6. Start, stop and status
