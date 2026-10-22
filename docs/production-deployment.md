@@ -80,24 +80,36 @@ The site config is in the repository:
 - [`deploy/nginx/agiolab.conf`](../deploy/nginx/agiolab.conf)
 - [`deploy/nginx/README.md`](../deploy/nginx/README.md)
 
-Install it on the production host:
+On a fresh host, issue the certificate before installing the TLS config:
 
 ```bash
+sudo install -d -m 755 /var/www/html/.well-known/acme-challenge
+sudo chown -R www-data:www-data /var/www/html
+
+sudo cp deploy/nginx/agiolab-acme.conf /etc/nginx/conf.d/agiolab-acme.conf
+sudo nginx -t
+sudo systemctl reload nginx
+
+sudo certbot certonly --webroot -w /var/www/html \
+  -d password.agiolab.com -d secrets.agiolab.com \
+  --cert-name agiolab.com \
+  --non-interactive --agree-tos --email admin@agiolab.com \
+  --deploy-hook "systemctl reload nginx"
+
+sudo rm /etc/nginx/conf.d/agiolab-acme.conf
 sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
-
-# Edit the certificate paths in /etc/nginx/conf.d/agiolab.conf:
-#   ssl_certificate     /etc/letsencrypt/live/agiolab.com/fullchain.pem;
-#   ssl_certificate_key /etc/letsencrypt/live/agiolab.com/privkey.pem;
-
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-The certificate must cover **both** names (SAN) or be a wildcard
-`*.agiolab.com`. If separate certificates are used, split the two server blocks
-and point each to its own files. Certificate renewal is handled by the host's
-existing tooling (for example certbot); the Docker stack does not manage TLS
-certificates.
+Both DNS names must already resolve to this host. The bootstrap and full config
+serve the ACME challenge from `/var/www/html`, so renewals continue to work.
+
+If you already have a certificate covering both names (SAN or wildcard
+`*.agiolab.com`), skip certbot and point the two `ssl_certificate` paths at it.
+The certificate must cover **both** names. If separate certificates are used,
+split the two server blocks and point each to its own files. Certificate renewal
+is handled by the host's tooling (for example the certbot timer).
 
 The important proxy directives are already in the template:
 
@@ -118,6 +130,18 @@ signed `Host` header and path. The proxy must not rewrite either.
 ---
 
 ## 5. Configuration
+
+The local environment files are git-ignored. On a clean production checkout,
+copy **both** `.env.dev` and `.env.prd` from the protected source (the current
+parity gate requires `.env.example`, `.env.dev` and `.env.prd`); `.env.dev` is
+not used by the prd stack. Verify with `sha256sum`, then:
+
+```bash
+sudo install -m 600 .env.dev .env.prd /opt/agiolab/tools-password-generator/
+cd /opt/agiolab/tools-password-generator
+./bin/check-env-parity.sh
+./bin/start.sh check-env
+```
 
 Relevant `.env.prd` values:
 

@@ -11,42 +11,68 @@ listens on 80/443 and proxies to the loopback-published services:
 There is **no Caddy service** in the production stack. The app and Secrets
 Manager are bound to loopback only; nginx is the public edge.
 
-## Install
+## First-time certificate issuance
 
-1. Copy the site config:
+The full site config references files under
+`/etc/letsencrypt/live/agiolab.com/`, which do not exist on a fresh host. Issue
+the certificate first with the HTTP-only bootstrap config:
 
-   ```bash
-   sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
-   ```
+```bash
+sudo install -d -m 755 /var/www/html/.well-known/acme-challenge
+sudo chown -R www-data:www-data /var/www/html
 
-2. Set the certificate paths in the file. The template uses:
+sudo cp deploy/nginx/agiolab-acme.conf /etc/nginx/conf.d/agiolab-acme.conf
+sudo nginx -t
+sudo systemctl reload nginx
 
-   ```nginx
-   ssl_certificate     /etc/letsencrypt/live/agiolab.com/fullchain.pem;
-   ssl_certificate_key /etc/letsencrypt/live/agiolab.com/privkey.pem;
-   ```
+sudo certbot certonly --webroot -w /var/www/html \
+  -d password.agiolab.com -d secrets.agiolab.com \
+  --cert-name agiolab.com \
+  --non-interactive --agree-tos --email admin@agiolab.com \
+  --deploy-hook "systemctl reload nginx"
 
-   Use a certificate with **both** names in its SAN, or a wildcard
-   `*.agiolab.com`. If you use separate certificates, split the
-   `password.agiolab.com` and `secrets.agiolab.com` server blocks and point each
-   to its own files.
+sudo rm /etc/nginx/conf.d/agiolab-acme.conf
+sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
 
-3. Validate and reload:
+Use the certificate on a host where both names already resolve to the server.
+The bootstrap and the full `agiolab.conf` HTTP blocks both serve
+`/.well-known/acme-challenge/` from `/var/www/html`, so renewals continue to
+work after the full config is installed.
 
-   ```bash
-   sudo nginx -t
-   sudo systemctl reload nginx
-   ```
+If you already have a certificate with both names in its SAN (or a wildcard
+`*.agiolab.com`), skip certbot, point the two `ssl_certificate` paths at it, and
+install `agiolab.conf` directly.
 
-4. Start the stack:
+## Install the full config
 
-   ```bash
-   ./bin/start.sh up prd
-   ```
+```bash
+sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
 
-   `start.sh` preflights host nginx: it must be listening on 443 and the enabled
-   nginx configuration must contain `server_name` for both names. It then waits
-   for the public HTTPS endpoints through nginx.
+The template uses:
+
+```nginx
+ssl_certificate     /etc/letsencrypt/live/agiolab.com/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/agiolab.com/privkey.pem;
+```
+
+If you use separate certificates, split the two server blocks and point each to
+its own files.
+
+Start the stack:
+
+```bash
+./bin/start.sh up prd
+```
+
+`start.sh` preflights host nginx: it must be listening on 443 and the enabled
+nginx configuration must contain `server_name` for both names. It then waits for
+the public HTTPS endpoints through nginx.
 
 ## DNS and firewall
 
