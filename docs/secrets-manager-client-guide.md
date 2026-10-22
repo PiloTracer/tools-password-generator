@@ -59,22 +59,30 @@ application and AgioLab.
 
 ## 3. Credentials
 
-AgioLab provisions a dedicated **access key id / secret access key** for your
-application out of band. They are not included in this document.
+AgioLab provides the instance **access key id / secret access key** out of band.
+They are not included in this document.
 
-- Use them only from your server-side application; never ship them to browsers,
-  mobile binaries or front-end code.
-- Store them in your own secret manager or CI secret store. Do not commit them.
-- The credential is authorized for this Secrets Manager instance. Use a distinct
-  credential per application/environment and rotate it on your normal schedule.
+This deployment uses a **single SigV4 principal**: the credential can manage all
+secrets in this Secrets Manager instance. There is no per-client IAM or
+per-secret permission layer. If your organization requires a separate
+credential or tenant isolation, AgioLab must provision a separate Secrets
+Manager instance.
+
+- Use the credential only from your server-side application; never ship it to
+  browsers, mobile binaries or front-end code.
+- Store it in your own secret manager or CI secret store. Do not commit it.
+- Rotate the instance credential on your normal security schedule; coordinate
+  the rotation with AgioLab so the password generator service and other clients
+  are updated together.
 - The field `region` must be exactly `us-east-1`; the signature is scoped to it.
-- If a session token is issued with your credentials, send it as
+- If a session token is issued with the credential, send it as
   `X-Amz-Security-Token` (all AWS SDKs do this automatically when configured).
 
-> **Isolation note.** The API uses a single authorization principal per
-> deployment: a credential can manage all secrets in this instance. Protect it
-> accordingly and use the naming convention below to separate tenants and
-> applications. Contact AgioLab if you require a separate instance.
+> **Isolation note.** Use the naming convention below to separate data, but be
+> aware that possession of the credential grants access to every secret in this
+> instance, including the password generator’s policy and integrity secrets.
+> Do not use this instance for unrelated tenants. Contact AgioLab if you need a
+> separate deployment.
 
 ---
 
