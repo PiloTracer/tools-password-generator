@@ -92,6 +92,8 @@ cd /opt/agiolab/tools-password-generator
 
 sudo ./bin/deploy-discovery.sh \
   --name agiolab-password-secrets \
+  --domain agiolab.com \
+  --domain www.agiolab.com \
   --domain password.agiolab.com \
   --domain secrets.agiolab.com \
   --port 80 --port 443 \
@@ -107,7 +109,7 @@ The script is generic; only the arguments above are repository-specific. Adjust
 `/opt/agiolab/tools-password-generator` to the actual checkout path. Without
 `sudo`, Docker and nginx ownership detail is reduced; the script warns.
 
-The four endpoints cover both names on ports 80 and 443 (host nginx). Port 443
+The eight endpoints cover all four names on ports 80 and 443 (host nginx). Port 443
 is TLS by default.
 
 ---
@@ -117,21 +119,23 @@ is TLS by default.
 Observed during the verification run (re-run on the production host before
 executing the runbook):
 
-- `password.agiolab.com` resolves to `80.65.211.200` (no AAAA/CNAME). Confirm
-  this is the production host's public IP and create the same A/AAAA records for
-  `secrets.agiolab.com`, which currently has **no A/AAAA record**.
+- `agiolab.com`, `www.agiolab.com`, `password.agiolab.com` and
+  `secrets.agiolab.com` all resolve to `80.65.211.200` via public resolvers.
+  Confirm this is the production host. The server's local resolver may cache an
+  older empty `secrets` answer; use `dig @1.1.1.1` and flush the cache.
 - Host nginx on 80/443 has **no agiolab server block yet**: port 80 serves the
   default site (HTTP 200) and port 443 returns 502 with a certificate not
   matching the domain. Install [`deploy/nginx/agiolab.conf`](../deploy/nginx/agiolab.conf),
   set the certificate paths, `nginx -t`, and reload nginx.
-- After the host nginx config is installed, the discovery should map
-  `password.agiolab.com:443` and `secrets.agiolab.com:443` to nginx and both
-  local HTTPS health checks should return 200.
+- After the host nginx config is installed, the discovery should map all four
+  names on 443 to nginx; apex and the password alias serve the app, `www`
+  redirects to the apex, and the local HTTPS health checks return 200.
 - Compose maps `app` → `127.0.0.1:18000` and `secrets-manager` →
   `127.0.0.1:18001`; there is **no Caddy/proxy service** in the production
   stack. The public edge is the host nginx.
-- The public URLs are standard HTTPS:
-  <https://password.agiolab.com> and <https://secrets.agiolab.com>.
+- The public URLs are standard HTTPS: <https://agiolab.com> (canonical),
+  <https://password.agiolab.com> (alias), <https://www.agiolab.com>
+  (redirect), and <https://secrets.agiolab.com>.
 
 These findings are why the production runbook treats host nginx as the edge and
 the Docker services as loopback-only upstreams.

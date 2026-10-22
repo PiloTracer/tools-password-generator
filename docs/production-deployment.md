@@ -11,7 +11,9 @@ integration details are in
 
 | Public name | Public URL | Public port | Edge | Backend |
 |---|---|---|---|---|
-| `password.agiolab.com` | <https://password.agiolab.com> | TCP 443 | host nginx → `127.0.0.1:18000` | Next.js password generator |
+| **`agiolab.com`** | <https://agiolab.com> | TCP 443 | host nginx → `127.0.0.1:18000` | Next.js password generator (canonical) |
+| `password.agiolab.com` | <https://password.agiolab.com> | TCP 443 | host nginx → `127.0.0.1:18000` | password generator alias |
+| `www.agiolab.com` | <https://www.agiolab.com> → `https://agiolab.com` | TCP 443 | host nginx redirect | alias |
 | `secrets.agiolab.com` | <https://secrets.agiolab.com> | TCP 443 | host nginx → `127.0.0.1:18001` | AWS-compatible Secrets Manager |
 
 Both names resolve to the production host. Host nginx selects the backend by
@@ -44,6 +46,10 @@ them.
 Create these records at the DNS provider for `agiolab.com`:
 
 ```text
+agiolab.com.            A     <production-host-ip>
+agiolab.com.            AAAA  <production-host-ipv6>   # if IPv6 is used
+www.agiolab.com.        A     <production-host-ip>
+www.agiolab.com.        AAAA  <production-host-ipv6>   # if IPv6 is used
 password.agiolab.com.   A     <production-host-ip>
 password.agiolab.com.   AAAA  <production-host-ipv6>   # if IPv6 is used
 secrets.agiolab.com.    A     <production-host-ip>
@@ -91,6 +97,7 @@ sudo nginx -t
 sudo systemctl reload nginx
 
 sudo certbot certonly --webroot -w /var/www/html \
+  -d agiolab.com -d www.agiolab.com \
   -d password.agiolab.com -d secrets.agiolab.com \
   --cert-name agiolab.com \
   --non-interactive --agree-tos --email admin@agiolab.com \
@@ -102,12 +109,12 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Both DNS names must already resolve to this host. The bootstrap and full config
+All four DNS names must already resolve to this host. The bootstrap and full config
 serve the ACME challenge from `/var/www/html`, so renewals continue to work.
 
-If you already have a certificate covering both names (SAN or wildcard
-`*.agiolab.com`), skip certbot and point the two `ssl_certificate` paths at it.
-The certificate must cover **both** names. If separate certificates are used,
+If you already have a certificate covering all names (SAN or wildcard
+`*.agiolab.com`), skip certbot and point the `ssl_certificate` paths at it.
+The certificate must cover **all four** names. If separate certificates are used,
 split the two server blocks and point each to its own files. Certificate renewal
 is handled by the host's tooling (for example the certbot timer).
 
@@ -146,9 +153,9 @@ cd /opt/agiolab/tools-password-generator
 Relevant `.env.prd` values:
 
 ```dotenv
-APP_HOST=password.agiolab.com
+APP_HOST=agiolab.com
 SECRETS_MANAGER_HOST=secrets.agiolab.com
-APP_PUBLIC_URL=https://password.agiolab.com
+APP_PUBLIC_URL=https://agiolab.com
 SECRETS_MANAGER_PUBLIC_URL=https://secrets.agiolab.com
 PUBLIC_HTTPS_PORT=443
 
@@ -216,13 +223,15 @@ sudo systemctl status nginx
 ### 7.1 Public endpoints
 
 ```bash
+curl -fsS https://agiolab.com/api/health
+curl -fsS https://agiolab.com/api/ready
 curl -fsS https://password.agiolab.com/api/health
-curl -fsS https://password.agiolab.com/api/ready
+curl -fsS -I https://www.agiolab.com/          # 301 to https://agiolab.com
 curl -fsS https://secrets.agiolab.com/healthz
 curl -fsS https://secrets.agiolab.com/readyz
 ```
 
-Expected: HTTP 200 from all four.
+Expected: HTTP 200 from the apex, password alias and Secrets Manager probes; `www` returns 301 to the apex.
 
 ### 7.2 AWS protocol through host nginx
 
@@ -250,7 +259,7 @@ The default verifier uses loopback `18001`; both hit the same service.
 ### 7.3 UI
 
 ```bash
-curl -fsS https://password.agiolab.com/ | grep -o '<title>[^<]*'
+curl -fsS https://agiolab.com/ | grep -o '<title>[^<]*'
 ```
 
 The title should contain “Secure Password Generator”.

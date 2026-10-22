@@ -23,7 +23,7 @@ Version 4. Values are encrypted at rest with AES-256-GCM.
 | **Service name** | `secretsmanager` |
 | **Auth** | AWS Signature Version 4 |
 | **Health check** | `GET https://secrets.agiolab.com/healthz` |
-| **Public password generator** | `https://password.agiolab.com` |
+| **Public password generator** | `https://agiolab.com` (alias: `https://password.agiolab.com`) |
 
 The endpoint uses standard HTTPS port **443** on the host nginx edge. There is
 no plaintext HTTP endpoint.
@@ -46,7 +46,9 @@ TCP 443, contact AgioLab operations before development starts.
 
 | Public name | Public URL | Transport | Backend service |
 |---|---|---|---|
-| `password.agiolab.com` | `https://password.agiolab.com` | HTTPS/TLS 443 | Password generator |
+| `agiolab.com` | `https://agiolab.com` | HTTPS/TLS 443 | Password generator (canonical) |
+| `password.agiolab.com` | `https://password.agiolab.com` | HTTPS/TLS 443 | Password generator alias |
+| `www.agiolab.com` | `https://www.agiolab.com` → `https://agiolab.com` | HTTPS/TLS 443 | Alias redirect |
 | `secrets.agiolab.com` | `https://secrets.agiolab.com` | HTTPS/TLS 443 | Secrets Manager API |
 
 Both names resolve to the same AgioLab production host. Host nginx routes by

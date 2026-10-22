@@ -51,7 +51,7 @@ host at a time** (`start.sh` enforces this):
 | Compose project | `passwordgenerator_dev` | `passwordgenerator_prd` |
 | App (internal) | <http://127.0.0.1:18000> | <http://127.0.0.1:18000> |
 | Secrets Manager (internal) | <http://127.0.0.1:18001> | <http://127.0.0.1:18001> |
-| Public HTTPS | — | <https://password.agiolab.com> / <https://secrets.agiolab.com> (host nginx) |
+| Public HTTPS | — | <https://agiolab.com> (aliases: password/www) / <https://secrets.agiolab.com> (host nginx) |
 | Data volume | `passwordgenerator_dev_secrets_data` | `passwordgenerator_prd_secrets_data` |
 | Backups | `backups/dev/` | `backups/prd/` |
 
@@ -141,7 +141,9 @@ touches the stack.
 
 | Public name | Public URL | Host port | Edge → upstream |
 |---|---|---|---|
-| `password.agiolab.com` | <https://password.agiolab.com> | 443 | host nginx → `127.0.0.1:18000` |
+| **`agiolab.com`** | <https://agiolab.com> | 443 | host nginx → `127.0.0.1:18000` (canonical) |
+| `password.agiolab.com` | <https://password.agiolab.com> | 443 | host nginx → `127.0.0.1:18000` (alias) |
+| `www.agiolab.com` | <https://www.agiolab.com> → `https://agiolab.com` | 443 | host nginx redirect |
 | `secrets.agiolab.com` | <https://secrets.agiolab.com> | 443 | host nginx → `127.0.0.1:18001` |
 
 Production uses the **host nginx** as the TLS edge; there is no Caddy service.
@@ -149,7 +151,7 @@ Ports 80/443 are host nginx; 18000/18001 are loopback. Dev/prd share
 18000/18001/18002, so run one environment per host.
 
 ```bash
-# 1. DNS: both names resolve to this host
+# 1. DNS: agiolab.com, www, password and secrets resolve to this host
 # 2. Firewall: allow inbound TCP 80 and 443 (host nginx)
 # 3. Install the nginx config and certificate (deploy/nginx/)
 sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
@@ -161,7 +163,7 @@ sudo nginx -t && sudo systemctl reload nginx
 ./bin/start.sh health prd --strict
 ```
 
-The certificate must cover both names (SAN or wildcard). Host nginx is outside
+The certificate must cover all four names (SAN or wildcard). Host nginx is outside
 Compose; `start.sh` validates the installed config and waits for the public
 endpoints. See [deploy/nginx/README.md](deploy/nginx/README.md), the full
 runbook: [docs/production-deployment.md](docs/production-deployment.md), and the
@@ -506,7 +508,7 @@ Health endpoints (no auth): `GET /healthz`, `GET /readyz`, `GET /` (info).
 
 ```bash
 # Local:  http://127.0.0.1:18000
-# Public: https://password.agiolab.com
+# Public: https://agiolab.com
 curl -s http://127.0.0.1:18000/api/generate \
   -H 'Content-Type: application/json' \
   -d '{"mode":"characters","length":24,"specialCount":3,"digitCount":3,"mixedCaseCount":6}'
