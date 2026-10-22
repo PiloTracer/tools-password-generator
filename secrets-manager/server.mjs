@@ -17,6 +17,81 @@ const VERSION = "1.0.0";
 const MAX_BODY_BYTES = 1024 * 1024;
 
 /**
+ * Parse the optional per-client SigV4 credentials.
+ *
+ * The primary SM_ACCESS_KEY_ID remains the full-access instance credential.
+ * Client credentials are restricted by name prefix in operations.mjs.
+ *
+ * @param {string|undefined} raw
+ * @param {string} primaryAccessKeyId
+ */
+function parseClientCredentials(raw, primaryAccessKeyId) {
+  const text = String(raw || "").trim();
+  if (!text) {
+    return [];
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("SM_CLIENTS_JSON must be valid JSON.");
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("SM_CLIENTS_JSON must be a JSON array.");
+  }
+
+  const seen = new Set(primaryAccessKeyId ? [primaryAccessKeyId] : []);
+  return parsed.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`SM_CLIENTS_JSON[${index}] must be an object.`);
+    }
+    const accessKeyId = String(entry.accessKeyId || "").trim();
+    const secretAccessKey = String(entry.secretAccessKey || "").trim();
+    if (!accessKeyId || !secretAccessKey) {
+      throw new Error(
+        `SM_CLIENTS_JSON[${index}] requires accessKeyId and secretAccessKey.`,
+      );
+    }
+    if (seen.has(accessKeyId)) {
+      throw new Error(`SM_CLIENTS_JSON contains a duplicate accessKeyId: ${accessKeyId}`);
+    }
+    seen.add(accessKeyId);
+
+    const sessionToken = String(entry.sessionToken || "").trim();
+    const name = String(entry.name || accessKeyId).trim();
+    const rawPrefixes = entry.allowedPrefixes;
+    if (!Array.isArray(rawPrefixes) || rawPrefixes.length === 0) {
+      throw new Error(
+        `SM_CLIENTS_JSON[${index}] requires at least one allowedPrefixes entry.`,
+      );
+    }
+    const allowedPrefixes = [];
+    for (const rawPrefix of rawPrefixes) {
+      let prefix = String(rawPrefix || "").trim();
+      if (!prefix) {
+        throw new Error(`SM_CLIENTS_JSON[${index}] has an empty allowedPrefixes entry.`);
+      }
+      if (!prefix.endsWith("/")) {
+        prefix += "/";
+      }
+      if (!allowedPrefixes.includes(prefix)) {
+        allowedPrefixes.push(prefix);
+      }
+    }
+
+    return {
+      accessKeyId,
+      secretAccessKey,
+      sessionToken,
+      name,
+      admin: false,
+      allowedPrefixes,
+    };
+  });
+}
+
+/**
  * @param {NodeJS.ProcessEnv} env
  */
 function loadConfig(env) {
@@ -35,6 +110,21 @@ function loadConfig(env) {
       "SM_ACCESS_KEY_ID and SM_SECRET_ACCESS_KEY are required when SM_REQUIRE_AUTH is enabled.",
     );
   }
+
+  const clients = parseClientCredentials(env.SM_CLIENTS_JSON, accessKeyId);
+  const principals = [
+    ...(accessKeyId && secretAccessKey
+      ? [{
+          accessKeyId,
+          secretAccessKey,
+          sessionToken,
+          name: "instance-admin",
+          admin: true,
+          allowedPrefixes: [],
+        }]
+      : []),
+    ...clients,
+  ];
 
   const port = Number.parseInt(env.SM_PORT || "8080", 10);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -74,6 +164,8 @@ function loadConfig(env) {
     accessKeyId,
     secretAccessKey,
     sessionToken,
+    principals,
+    clients,
     requireAuth,
     masterKey: env.SM_MASTER_KEY || "",
     dataDir: env.SM_DATA_DIR || "/data",
@@ -331,6 +423,12 @@ function main() {
 
       const body = await readBody(req);
 
+      let principal = {
+        accessKeyId: "anonymous",
+        name: "anonymous",
+        admin: true,
+        allowedPrefixes: [],
+      };
       if (config.requireAuth) {
         const verification = verifyRequest({
           method: req.method,
@@ -338,9 +436,7 @@ function main() {
           headers: req.headers,
           body,
           config: {
-            accessKeyId: config.accessKeyId,
-            secretAccessKey: config.secretAccessKey,
-            sessionToken: config.sessionToken,
+            credentials: config.principals,
             region: config.region,
             service: config.service,
             maxClockSkewMs: config.maxClockSkewMs,
@@ -349,6 +445,7 @@ function main() {
         if (!verification.ok) {
           throw verification.error;
         }
+        principal = verification.principal;
       }
 
       let payload = {};
@@ -371,7 +468,7 @@ function main() {
         throw unknownOperation(target);
       }
 
-      const result = dispatch(operation, payload, store);
+      const result = dispatch(operation, payload, store, principal);
       logger.debug("request completed", {
         requestId,
         operation,
@@ -425,6 +522,7 @@ function main() {
       region: config.region,
       accountId: config.accountId,
       authRequired: config.requireAuth,
+      clientCredentials: config.clients.length,
       dataDir: config.dataDir,
       secrets: store.health().secrets,
     });

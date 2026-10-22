@@ -59,30 +59,33 @@ application and AgioLab.
 
 ## 3. Credentials
 
-AgioLab provides the instance **access key id / secret access key** out of band.
+AgioLab provides the **client access key id / secret access key** out of band.
 They are not included in this document.
 
-This deployment uses a **single SigV4 principal**: the credential can manage all
-secrets in this Secrets Manager instance. There is no per-client IAM or
-per-secret permission layer. If your organization requires a separate
-credential or tenant isolation, AgioLab must provision a separate Secrets
-Manager instance.
+Credentials are issued **per client**. Each client credential is scoped to an
+allowed secret-name prefix; for this ACB onboarding the prefix is
+`client/acb/`. The credential cannot read or list the password generator's own
+`password-generator/...` secrets, and it cannot create secrets outside
+`client/acb/`.
+
+The service supports multiple client credentials, but it is not IAM/STS: there
+are no roles, policies or temporary credentials. `ListSecrets` and
+`BatchGetSecretValue` are filtered to the client's prefix, and operations on
+other secrets return `AccessDeniedException`.
 
 - Use the credential only from your server-side application; never ship it to
   browsers, mobile binaries or front-end code.
 - Store it in your own secret manager or CI secret store. Do not commit it.
-- Rotate the instance credential on your normal security schedule; coordinate
-  the rotation with AgioLab so the password generator service and other clients
-  are updated together.
+- Rotate the client credential on your normal security schedule; coordinate the
+  rotation with AgioLab before the old secret is disabled.
 - The field `region` must be exactly `us-east-1`; the signature is scoped to it.
 - If a session token is issued with the credential, send it as
   `X-Amz-Security-Token` (all AWS SDKs do this automatically when configured).
 
-> **Isolation note.** Use the naming convention below to separate data, but be
-> aware that possession of the credential grants access to every secret in this
-> instance, including the password generator’s policy and integrity secrets.
-> Do not use this instance for unrelated tenants. Contact AgioLab if you need a
-> separate deployment.
+> **Isolation note.** The client credential is restricted to `client/acb/`.
+> Do not share it with other clients or with the password-generator application.
+> If you need a different prefix or a separate deployment, contact AgioLab
+> before issuing credentials.
 
 ---
 

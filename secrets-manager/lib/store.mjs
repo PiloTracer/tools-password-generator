@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  accessDenied,
   invalidParameter,
   invalidRequest,
   resourceExists,
@@ -14,6 +15,17 @@ const NAME_PATTERN = /^[a-zA-Z0-9/_+=.@-]+$/;
 const VERSION_STAGE_PATTERN = /^[a-zA-Z0-9_]+$/;
 const CLIENT_TOKEN_PATTERN = /^[a-zA-Z0-9-]{1,64}$/;
 const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * @param {string} name
+ * @param {string[]|null|undefined} scopePrefixes
+ */
+function isNameInScope(name, scopePrefixes) {
+  if (scopePrefixes === null || scopePrefixes === undefined) {
+    return true;
+  }
+  return scopePrefixes.some((prefix) => name.startsWith(prefix));
+}
 
 /**
  * @param {string} value
@@ -769,13 +781,18 @@ export class SecretStore {
     return response;
   }
 
-  /** @param {Record<string, any>} input */
-  listSecrets(input) {
+  /**
+   * @param {Record<string, any>} input
+   * @param {string[]|null} [scopePrefixes]
+   */
+  listSecrets(input, scopePrefixes = null) {
     const filters = this.parseFilters(input.Filters);
     const includeDeleted = input.IncludePlannedDeletion === true;
 
     let secrets = this.data.secrets.filter(
-      (secret) => includeDeleted || !secret.deletedDate,
+      (secret) =>
+        (includeDeleted || !secret.deletedDate) &&
+        isNameInScope(secret.name, scopePrefixes),
     );
     if (filters.length > 0) {
       secrets = secrets.filter((secret) => this.matchesFilters(secret, filters));
@@ -973,8 +990,11 @@ export class SecretStore {
     return {};
   }
 
-  /** @param {Record<string, any>} input */
-  batchGetSecretValue(input) {
+  /**
+   * @param {Record<string, any>} input
+   * @param {string[]|null} [scopePrefixes]
+   */
+  batchGetSecretValue(input, scopePrefixes = null) {
     const hasIds = Array.isArray(input.SecretIdList) && input.SecretIdList.length > 0;
     const hasFilters = Array.isArray(input.Filters) && input.Filters.length > 0;
     if (!hasIds && !hasFilters) {
@@ -1000,6 +1020,11 @@ export class SecretStore {
           }
           const secret = this.findSecret(secretId);
           this.assertNotDeleted(secret);
+          if (!isNameInScope(secret.name, scopePrefixes)) {
+            throw accessDenied(
+              "The client credential is not authorized to access this secret.",
+            );
+          }
           targets.push(secret);
         } catch (error) {
           errors.push({
@@ -1012,7 +1037,10 @@ export class SecretStore {
     } else {
       const filters = this.parseFilters(input.Filters);
       targets = this.data.secrets.filter(
-        (secret) => !secret.deletedDate && this.matchesFilters(secret, filters),
+        (secret) =>
+          !secret.deletedDate &&
+          this.matchesFilters(secret, filters) &&
+          isNameInScope(secret.name, scopePrefixes),
       );
     }
 

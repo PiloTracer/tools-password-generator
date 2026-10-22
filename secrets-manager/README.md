@@ -196,6 +196,7 @@ The API reference is [API.md](API.md); the OpenAPI document is
 | `SM_ACCESS_KEY_ID` | — | Required when auth is on |
 | `SM_SECRET_ACCESS_KEY` | — | Required when auth is on |
 | `SM_SESSION_TOKEN` | — | Optional; verified when set |
+| `SM_CLIENTS_JSON` | — | Optional JSON array of scoped client credentials: `accessKeyId`, `secretAccessKey`, optional `sessionToken`, `name`, `allowedPrefixes` |
 | `SM_REQUIRE_AUTH` | `true` | `false` disables verification (debug only) |
 | `SM_MASTER_KEY` | — | 32-byte key, hex or base64 |
 | `SM_MAX_SECRET_BYTES` | `65536` | Value limit |
@@ -234,7 +235,7 @@ This is a faithful local endpoint, not a complete AWS emulator:
 - resource policies and replication return unsupported errors;
 - `KmsKeyId` is accepted and stored, but encryption uses the local master key;
 - secret values are capped at 64 KiB and the request body at 1 MiB;
-- SigV4 header auth only (no presigned URLs), single credential set;
+- SigV4 header auth only (no presigned URLs); the primary credential is full-access and `SM_CLIENTS_JSON` entries are prefix-scoped;
 - The service uses HTTP inside the private Compose network. The production
   host nginx terminates TLS on port 443 and proxies to loopback 18001; the
   loopback port is not public.

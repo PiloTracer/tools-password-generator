@@ -1,24 +1,116 @@
-import { invalidParameter, unknownOperation } from "./errors.mjs";
+import { accessDenied, invalidParameter, unknownOperation } from "./errors.mjs";
 import { isPlainObject } from "./util.mjs";
 
 /**
- * AWS Secrets Manager operation -> SecretStore method.
- * The target name in the `X-Amz-Target` header selects one of these.
+ * @typedef {{
+ *   accessKeyId?: string,
+ *   name?: string,
+ *   admin?: boolean,
+ *   allowedPrefixes?: string[],
+ * }} Principal
  */
+
+/** @param {Principal|null|undefined} principal */
+function isAdmin(principal) {
+  return !principal || principal.admin === true;
+}
+
+/** @param {Principal|null|undefined} principal */
+function allowedPrefixes(principal) {
+  return Array.isArray(principal?.allowedPrefixes)
+    ? principal.allowedPrefixes.filter((prefix) => typeof prefix === "string" && prefix.length > 0)
+    : [];
+}
+
+/**
+ * @param {unknown} name
+ * @param {Principal|null|undefined} principal
+ */
+function nameAllowed(name, principal) {
+  if (isAdmin(principal)) {
+    return true;
+  }
+  if (typeof name !== "string" || name.length === 0) {
+    return true; // Let the store produce the normal InvalidParameterException.
+  }
+  const prefixes = allowedPrefixes(principal);
+  return prefixes.some((prefix) => name.startsWith(prefix));
+}
+
+/**
+ * @param {unknown} name
+ * @param {Principal|null|undefined} principal
+ */
+function assertNameAllowed(name, principal) {
+  if (!nameAllowed(name, principal)) {
+    throw accessDenied("The client credential is not authorized to access this secret name.");
+  }
+}
+
+/**
+ * @param {import("./store.mjs").SecretStore} store
+ * @param {Record<string, any>} input
+ * @param {Principal|null|undefined} principal
+ */
+function assertSecretAllowed(store, input, principal) {
+  if (isAdmin(principal) || typeof input.SecretId !== "string" || input.SecretId.length === 0) {
+    return;
+  }
+  const secret = store.findSecret(input.SecretId);
+  assertNameAllowed(secret.name, principal);
+}
+
+/** @param {Principal|null|undefined} principal */
+function scopePrefixes(principal) {
+  return isAdmin(principal) ? null : allowedPrefixes(principal);
+}
+
 const HANDLERS = Object.freeze({
-  BatchGetSecretValue: (store, input) => store.batchGetSecretValue(input),
-  CreateSecret: (store, input) => store.createSecret(input),
-  DeleteSecret: (store, input) => store.deleteSecret(input),
-  DescribeSecret: (store, input) => store.describeSecret(input),
+  BatchGetSecretValue: (store, input, principal) =>
+    store.batchGetSecretValue(input, scopePrefixes(principal)),
+  CreateSecret: (store, input, principal) => {
+    assertNameAllowed(input.Name, principal);
+    return store.createSecret(input);
+  },
+  DeleteSecret: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.deleteSecret(input);
+  },
+  DescribeSecret: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.describeSecret(input);
+  },
   GetRandomPassword: (store, input) => store.getRandomPassword(input),
-  GetSecretValue: (store, input) => store.getSecretValue(input),
-  ListSecretVersionIds: (store, input) => store.listSecretVersionIds(input),
-  ListSecrets: (store, input) => store.listSecrets(input),
-  PutSecretValue: (store, input) => store.putSecretValue(input),
-  RestoreSecret: (store, input) => store.restoreSecret(input),
-  TagResource: (store, input) => store.tagResource(input),
-  UntagResource: (store, input) => store.untagResource(input),
-  UpdateSecret: (store, input) => store.updateSecret(input),
+  GetSecretValue: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.getSecretValue(input);
+  },
+  ListSecretVersionIds: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.listSecretVersionIds(input);
+  },
+  ListSecrets: (store, input, principal) =>
+    store.listSecrets(input, scopePrefixes(principal)),
+  PutSecretValue: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.putSecretValue(input);
+  },
+  RestoreSecret: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.restoreSecret(input);
+  },
+  TagResource: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.tagResource(input);
+  },
+  UntagResource: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.untagResource(input);
+  },
+  UpdateSecret: (store, input, principal) => {
+    assertSecretAllowed(store, input, principal);
+    return store.updateSecret(input);
+  },
 });
 
 export const SUPPORTED_OPERATIONS = Object.freeze(Object.keys(HANDLERS).sort());
@@ -29,9 +121,10 @@ export const SUPPORTED_OPERATIONS = Object.freeze(Object.keys(HANDLERS).sort());
  * @param {string} operation
  * @param {unknown} input
  * @param {import("./store.mjs").SecretStore} store
+ * @param {Principal|null} [principal]
  * @returns {Record<string, unknown>}
  */
-export function dispatch(operation, input, store) {
+export function dispatch(operation, input, store, principal = null) {
   if (
     typeof operation !== "string" ||
     !Object.prototype.hasOwnProperty.call(HANDLERS, operation)
@@ -42,5 +135,5 @@ export function dispatch(operation, input, store) {
   if (!isPlainObject(payload)) {
     throw invalidParameter("The request body must be a JSON object.");
   }
-  return HANDLERS[operation](store, payload);
+  return HANDLERS[operation](store, payload, principal);
 }

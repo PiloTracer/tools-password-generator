@@ -147,9 +147,17 @@ export function signRequest(options) {
 
 /**
  * @typedef {{
- *   accessKeyId: string,
- *   secretAccessKey: string,
+ *   accessKeyId?: string,
+ *   secretAccessKey?: string,
  *   sessionToken?: string,
+ *   credentials?: Array<{
+ *     accessKeyId: string,
+ *     secretAccessKey: string,
+ *     sessionToken?: string,
+ *     name?: string,
+ *     admin?: boolean,
+ *     allowedPrefixes?: string[],
+ *   }>,
  *   region: string,
  *   service?: string,
  *   maxClockSkewMs?: number,
@@ -167,7 +175,14 @@ export function signRequest(options) {
  *   config: VerifyConfig,
  *   now?: number,
  * }} options
- * @returns {{ok: true}|{ok: false, error: import("./errors.mjs").AwsError}}
+ * @returns {{ok: true, principal: {
+ *   accessKeyId: string,
+ *   secretAccessKey: string,
+ *   sessionToken?: string,
+ *   name?: string,
+ *   admin?: boolean,
+ *   allowedPrefixes?: string[],
+ * }}|{ok: false, error: import("./errors.mjs").AwsError}}
  */
 export function verifyRequest(options) {
   const { method, url, body = "", config, now = Date.now() } = options;
@@ -201,7 +216,20 @@ export function verifyRequest(options) {
   }
   const [accessKeyId, dateStamp, region, credentialService, terminator] = credentialParts;
 
-  if (accessKeyId !== config.accessKeyId) {
+  let principal;
+  if (Array.isArray(config.credentials) && config.credentials.length > 0) {
+    principal = config.credentials.find((candidate) => candidate.accessKeyId === accessKeyId);
+  } else if (config.accessKeyId && accessKeyId === config.accessKeyId) {
+    principal = {
+      accessKeyId: config.accessKeyId,
+      secretAccessKey: config.secretAccessKey,
+      sessionToken: config.sessionToken,
+      name: "instance-admin",
+      admin: true,
+      allowedPrefixes: [],
+    };
+  }
+  if (!principal) {
     return { ok: false, error: unrecognizedClient() };
   }
   if (credentialService !== service) {
@@ -243,7 +271,7 @@ export function verifyRequest(options) {
     return { ok: false, error: requestExpired() };
   }
 
-  if (config.sessionToken && headers["x-amz-security-token"] !== config.sessionToken) {
+  if (principal.sessionToken && headers["x-amz-security-token"] !== principal.sessionToken) {
     return { ok: false, error: unrecognizedClient() };
   }
 
@@ -290,7 +318,7 @@ export function verifyRequest(options) {
 
   const scope = `${dateStamp}/${region}/${service}/${TERMINATOR}`;
   const stringToSign = [ALGORITHM, amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
-  const signingKey = deriveSigningKey(config.secretAccessKey, dateStamp, region, service);
+  const signingKey = deriveSigningKey(principal.secretAccessKey, dateStamp, region, service);
   const expectedSignature = crypto
     .createHmac("sha256", signingKey)
     .update(stringToSign, "utf8")
@@ -300,5 +328,5 @@ export function verifyRequest(options) {
     return { ok: false, error: invalidSignature() };
   }
 
-  return { ok: true };
+  return { ok: true, principal };
 }

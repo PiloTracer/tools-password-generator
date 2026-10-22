@@ -115,7 +115,7 @@ proxies to those loopback ports. There is no Caddy service.
 
 ### Environment parity
 
-`.env.example` is the canonical reference: it declares all 32 variables with
+`.env.example` is the canonical reference: it declares all 33 variables with
 `# optional` and `# secret` annotations. All three files are **line-aligned** —
 every key sits on the same line number — so a missing variable is a missing
 line and a value-only diff is immediately visible.
@@ -489,6 +489,7 @@ overwrite existing values (for example after changing the word list):
 | `SM_ACCESS_KEY_ID` | — | SigV4 access key (required) |
 | `SM_SECRET_ACCESS_KEY` | — | SigV4 secret (required) |
 | `SM_SESSION_TOKEN` | — | Optional session token |
+| `SM_CLIENTS_JSON` | — | Optional scoped client credentials (JSON array); each client is limited to `allowedPrefixes` |
 | `SM_REQUIRE_AUTH` | `true` | Set `false` only for isolated debugging |
 | `SM_MASTER_KEY` | — | 32-byte hex/base64 key; else `master.key` |
 | `SM_MAX_SECRET_BYTES` | `65536` | Per-value limit |
@@ -701,7 +702,7 @@ npm run build
 ├── docker-compose.prd.yml
 ├── Dockerfile.password.dev
 ├── Dockerfile.password.prd
-├── .env.example                  # canonical reference (all 32 variables)
+├── .env.example                  # canonical reference (all 33 variables)
 ├── .env.dev / .env.prd         # local runtime, git-ignored
 ├── password_generator.py
 ├── eff_short_wordlist_1.txt

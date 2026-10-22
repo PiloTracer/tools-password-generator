@@ -77,7 +77,7 @@ the service must forward both unchanged.
 
 The server verifies:
 
-- the access key id,
+- the access key id (maps to the primary or a scoped client credential),
 - the credential scope (`<date>/<region>/secretsmanager/aws4_request`),
 - the signed `host` header (it must be part of `SignedHeaders`),
 - the payload hash when `X-Amz-Content-SHA256` is present
@@ -97,10 +97,11 @@ export AWS_PAGER=""
 export AWS_ENDPOINT_URL_SECRETSMANAGER=http://127.0.0.1:18001
 ```
 
-> **Single principal.** Every authenticated client has full access to every
-> secret. There are no IAM policies, resource policies or per-secret
-> permissions. Restrict access at the network layer and use distinct
-> deployments/credentials where tenant isolation is required.
+> **Multiple clients, prefix-scoped.** The primary credential is full-access.
+> Additional credentials configured through `SM_CLIENTS_JSON` are limited to
+> their `allowedPrefixes`: list/batch operations are filtered, and operations on
+> other secret names return `AccessDeniedException`. This is not IAM/STS; there
+> are no policies, roles, or temporary credentials.
 
 Only header-based SigV4 is supported; presigned query URLs are rejected.
 
@@ -648,14 +649,16 @@ The policy payload is documented in the [root README](../README.md#6-aws-compati
 
   Do not strip or rewrite the request path; the signature covers it.
 
-- **Rotate credentials.** Change `SECRETS_MANAGER_SECRET_ACCESS_KEY` and update
-  every client. Prefer distinct credentials per environment.
+- **Rotate credentials.** Change `SECRETS_MANAGER_SECRET_ACCESS_KEY` (or the
+  relevant `SM_CLIENTS_JSON` entry) and update every affected client. Prefer
+  distinct credentials per environment and per client.
 - **Protect the master key.** Values are AES-256-GCM encrypted. The key lives
   in the data volume (`/data/master.key`, mode `0600`) or comes from
   `SECRETS_MANAGER_MASTER_KEY`. Backups include it when stored in the volume —
   treat backup bundles as secrets.
-- **Limit the blast radius.** There is one authorization principal. Isolate
-  deployments or add a proxy-level ACL if multiple teams share a host.
+- **Limit the blast radius.** The primary credential is full-access; issue
+  scoped `SM_CLIENTS_JSON` credentials for clients. Isolate deployments or add
+  a proxy-level ACL if multiple teams share a host.
 - **Back up before rotating.** Use `./bin/start.sh backup <env>`; restore with
   `./bin/start.sh restore <env> <bundle>`.
 

@@ -165,16 +165,40 @@ SECRETS_MANAGER_BIND_ADDRESS=127.0.0.1
 SECRETS_MANAGER_PORT=18001
 ```
 
-The environment files are line-aligned with `.env.example` (32 keys):
+The environment files are line-aligned with `.env.example` (33 keys):
 
 ```bash
 ./bin/check-env-parity.sh
-# env-parity: .env.example .env.dev .env.prd: 32 keys, line-aligned, ...
+# env-parity: .env.example .env.dev .env.prd: 33 keys, line-aligned, ...
 ```
 
 Rotate the Secrets Manager access key/secret for production and keep `.env.prd`
 mode `600`. The app and Secrets Manager bind to loopback; host nginx is the only
 public listener.
+
+### Client credentials
+
+The primary `SECRETS_MANAGER_ACCESS_KEY_ID` remains the full-access instance
+credential used by the password generator. Additional clients are configured in
+`SM_CLIENTS_JSON` as a JSON array of scoped SigV4 credentials:
+
+```dotenv
+SM_CLIENTS_JSON='[{"name":"acb","accessKeyId":"acb-prd-access","secretAccessKey":"<64-hex>","sessionToken":"","allowedPrefixes":["client/acb/"]}]'
+```
+
+Each client can only list, read, write, tag, delete or restore secrets whose
+names start with one of its `allowedPrefixes`. The password generator's
+`password-generator/...` secrets are not visible to the client. Generate the
+client secret with `openssl rand -hex 32`; never commit it. After changing
+`SM_CLIENTS_JSON`, recreate the Secrets Manager container:
+
+```bash
+./bin/start.sh recreate prd
+```
+
+Use a distinct access key and secret for dev and prd. The ACB client also needs
+the endpoint (`https://secrets.agiolab.com` in prd) and `us-east-1`; its session
+token is empty because this service does not issue temporary STS credentials.
 
 ---
 
