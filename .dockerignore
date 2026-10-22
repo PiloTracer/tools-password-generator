@@ -1,16 +1,37 @@
+# Version control / metadata
 .git
+.gitattributes
 .gitignore
 .dockerignore
 Dockerfile*
-docker-compose*
+docker-compose*.yml
 README.md
 LICENSE
-node_modules
-npm-debug.log
+
+# Local state that must never end up in an image
+backups
+.run
 __pycache__
 *.pyc
-.env
-.env.local
+*.pyo
+*.log
 .DS_Store
+Thumbs.db
+
+# Environment files and TLS material (never bake into images)
+.env
+.env.*
+!.env.example*
+
+# Node / Next.js build output is produced inside the build stages
 password/node_modules
 password/.next
+password/out
+password/coverage
+password/npm-debug.log*
+node_modules
+npm-debug.log*
+
+# Tooling
+.vscode
+.idea

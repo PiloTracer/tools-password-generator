@@ -1,0 +1,29 @@
+# Keep every text file checked out with LF line endings. CRLF breaks the shell
+# scripts, Dockerfiles and Compose files used by ./bin/start.sh.
+* text=auto eol=lf
+
+*.sh            text eol=lf
+*.mjs           text eol=lf
+*.js            text eol=lf
+*.ts            text eol=lf
+*.tsx           text eol=lf
+*.json          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.md            text eol=lf
+*.py            text eol=lf
+*.css           text eol=lf
+*.txt           text eol=lf
+Dockerfile*     text eol=lf
+.dockerignore   text eol=lf
+.env.*          text eol=lf
+
+# Binary assets
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.webp          binary
+*.gz            binary
+*.tar.gz        binary

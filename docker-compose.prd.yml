@@ -1,0 +1,119 @@
+# =============================================================================
+#  Secure Password Generator - PRODUCTION stack  (suffix: prd)
+#
+#  Usage:
+#    ./bin/start.sh up prd          (recommended: builds, seeds and checks health)
+#    docker compose --env-file .env.prd -f docker-compose.prd.yml up -d --build
+#
+#  Services:
+#    app              Next.js 16 standalone production server
+#    secrets-manager  AWS Secrets Manager compatible endpoint on port 8080
+# =============================================================================
+name: ${COMPOSE_PROJECT_NAME:-passwordgenerator_prd}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  secrets-manager:
+    image: password_secrets_manager:prd
+    container_name: password_secrets_prd
+    build:
+      context: .
+      dockerfile: secrets-manager/Dockerfile
+    environment:
+      SM_PORT: "8080"
+      SM_DATA_DIR: /data
+      SM_REGION: ${SECRETS_MANAGER_REGION:-us-east-1}
+      SM_ACCOUNT_ID: ${SECRETS_MANAGER_ACCOUNT_ID:-000000000000}
+      SM_ACCESS_KEY_ID: ${SECRETS_MANAGER_ACCESS_KEY_ID:?SECRETS_MANAGER_ACCESS_KEY_ID is required in .env.prd}
+      SM_SECRET_ACCESS_KEY: ${SECRETS_MANAGER_SECRET_ACCESS_KEY:?SECRETS_MANAGER_SECRET_ACCESS_KEY is required in .env.prd}
+      SM_SESSION_TOKEN: ${SECRETS_MANAGER_SESSION_TOKEN:-}
+      SM_REQUIRE_AUTH: "true"
+      SM_MASTER_KEY: ${SECRETS_MANAGER_MASTER_KEY:-}
+      SM_LOG_LEVEL: ${LOG_LEVEL:-info}
+      SEED_ENV: prd
+      SEED_WORDLIST: /seed/eff_short_wordlist_1.txt
+      SEED_CONFIG_SECRET_ID: ${APP_CONFIG_SECRET_ID:-password-generator/prd/app-config}
+      SEED_INTEGRITY_SECRET_ID: ${INTEGRITY_SECRET_ID:-password-generator/prd/integrity}
+      TZ: ${TZ:-America/Costa_Rica}
+    volumes:
+      - secrets_data:/data
+      - ./eff_short_wordlist_1.txt:/seed/eff_short_wordlist_1.txt:ro
+    ports:
+      - "${SECRETS_MANAGER_BIND_ADDRESS:-127.0.0.1}:${SECRETS_MANAGER_PORT:-18001}:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    init: true
+    logging: *default-logging
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  app:
+    image: password_app_prd:latest
+    container_name: password_app_prd
+    build:
+      context: .
+      dockerfile: Dockerfile.password.prd
+    depends_on:
+      secrets-manager:
+        condition: service_healthy
+    environment:
+      APP_ENV: prd
+      APP_VERSION: ${APP_VERSION:-1.0.0}
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      TZ: ${TZ:-America/Costa_Rica}
+      PASSWORD_GENERATOR_SCRIPT: ${PASSWORD_GENERATOR_SCRIPT:-/app/password_generator.py}
+      WORDLIST_PATH: ${WORDLIST_PATH:-/app/eff_short_wordlist_1.txt}
+      PYTHON_BIN: ${PYTHON_BIN:-python3}
+      SECRETS_MANAGER_ENABLED: ${SECRETS_MANAGER_ENABLED:-true}
+      SECRETS_MANAGER_ENDPOINT: ${SECRETS_MANAGER_ENDPOINT:-http://secrets-manager:8080}
+      APP_CONFIG_SECRET_ID: ${APP_CONFIG_SECRET_ID:-password-generator/prd/app-config}
+      INTEGRITY_SECRET_ID: ${INTEGRITY_SECRET_ID:-password-generator/prd/integrity}
+      SECRETS_CACHE_TTL_MS: ${SECRETS_CACHE_TTL_MS:-60000}
+      AWS_REGION: ${SECRETS_MANAGER_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${SECRETS_MANAGER_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${SECRETS_MANAGER_ACCESS_KEY_ID:?SECRETS_MANAGER_ACCESS_KEY_ID is required in .env.prd}
+      AWS_SECRET_ACCESS_KEY: ${SECRETS_MANAGER_SECRET_ACCESS_KEY:?SECRETS_MANAGER_SECRET_ACCESS_KEY is required in .env.prd}
+      AWS_SESSION_TOKEN: ${SECRETS_MANAGER_SESSION_TOKEN:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-18000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 8s
+      retries: 6
+      start_period: 60s
+    stop_grace_period: 20s
+    restart: unless-stopped
+    init: true
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+
+volumes:
+  secrets_data:
+    name: ${COMPOSE_PROJECT_NAME:-passwordgenerator_prd}_secrets_data
+    labels:
+      com.pwdgen.backup: "true"
+      com.pwdgen.description: "Secrets Manager encrypted store (prd)"

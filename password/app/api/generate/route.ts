@@ -1,83 +1,55 @@
+import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { spawn } from "child_process";
-import path from "node:path";
+
+import { runGenerator } from "@/lib/generator";
+import { checkRateLimit } from "@/lib/rate-limit";
+import { getRuntimeConfig } from "@/lib/runtime-config";
+import { verifyWordlist } from "@/lib/wordlist";
 
 export const runtime = "nodejs";
-
-type CharacterPayload = {
-  mode: "characters";
-  length?: number;
-  specialCount?: number;
-  digitCount?: number;
-  mixedCaseCount?: number;
-  excludeAmbiguous?: boolean;
-};
-
-type PassphrasePayload = {
-  mode: "words";
-  wordCount?: number;
-  wordSeparator?: string;
-  passphraseDigitCount?: number;
-  passphraseSpecialCount?: number;
-  passphraseMixedCount?: number;
-  randomizeWordCapitalization?: boolean;
-  excludeAmbiguous?: boolean;
-};
-
-type Payload = (CharacterPayload | PassphrasePayload) & {
-  requestId?: string;
-};
-
-const LIMITS = {
-  length: { min: 4, max: 256, default: 16 },
-  specialCount: { min: 0, max: 64, default: 2 },
-  digitCount: { min: 0, max: 64, default: 2 },
-  mixedCaseCount: { min: 0, max: 128, default: 6 },
-  wordCount: { min: 2, max: 16, default: 4 },
-  passphraseDigitCount: { min: 0, max: 32, default: 2 },
-  passphraseSpecialCount: { min: 0, max: 32, default: 1 },
-  passphraseMixedCount: { min: 0, max: 64, default: 2 },
-};
+export const dynamic = "force-dynamic";
 
 const SAFE_SEPARATOR_REGEX = /^[\w\-_.:|~]{0,5}$/;
 
-function sanitizeNumber(
-  raw: unknown,
-  key:
-    | "length"
-    | "specialCount"
-    | "digitCount"
-    | "mixedCaseCount"
-    | "wordCount"
-    | "passphraseDigitCount"
-    | "passphraseSpecialCount"
-    | "passphraseMixedCount",
-): number {
-  const limits = LIMITS[key];
-  if (typeof raw === "number" && Number.isInteger(raw)) {
-    return clamp(raw, limits.min, limits.max);
+function toInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return value;
   }
-  if (typeof raw === "string" && raw.trim()) {
-    const parsed = Number.parseInt(raw, 10);
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number.parseInt(value, 10);
     if (Number.isInteger(parsed)) {
-      return clamp(parsed, limits.min, limits.max);
+      return parsed;
     }
   }
-  return limits.default;
+  return undefined;
 }
 
-function clamp(value: number, min: number, max: number): number {
-  if (Number.isNaN(value)) {
-    return min;
+function numberWithin(value: unknown, min: number, max: number, fallback: number): number {
+  const parsed = toInteger(value);
+  if (parsed === undefined) {
+    return fallback;
   }
-  return Math.max(min, Math.min(value, max));
+  return Math.max(min, Math.min(max, parsed));
 }
 
-function sanitizeSeparator(raw: unknown): string {
-  if (typeof raw !== "string") {
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (value === "true") {
+    return true;
+  }
+  if (value === "false") {
+    return false;
+  }
+  return fallback;
+}
+
+function sanitizeSeparator(value: unknown): string {
+  if (typeof value !== "string") {
     return "-";
   }
-  const trimmed = raw.trim();
+  const trimmed = value.trim();
   if (!trimmed) {
     return "-";
   }
@@ -87,134 +59,212 @@ function sanitizeSeparator(raw: unknown): string {
   return trimmed;
 }
 
-function sanitizeBoolean(raw: unknown, fallback: boolean): boolean {
-  if (typeof raw === "boolean") {
-    return raw;
+function clientKey(request: NextRequest): string {
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const first = forwarded.split(",")[0]?.trim();
+    if (first) {
+      return first;
+    }
   }
-  if (typeof raw === "string") {
-    if (raw === "true") return true;
-    if (raw === "false") return false;
-  }
-  return fallback;
+  const realIp = request.headers.get("x-real-ip")?.trim();
+  return realIp || "unknown";
 }
 
-async function invokePython(args: string[]): Promise<string> {
-  const scriptPath = path.resolve(process.cwd(), "..", "password_generator.py");
-  const finalArgs = [scriptPath, "--non-interactive", ...args];
-
-  return new Promise((resolve, reject) => {
-    const child = spawn("python", finalArgs, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        const lines = stdout.trim().split(/\r?\n/);
-        const lastLine = lines.reverse().find((line) => line.trim().length > 0);
-        if (!lastLine) {
-          reject(new Error("Password generator produced no output."));
-          return;
-        }
-        resolve(lastLine.trim());
-      } else {
-        reject(new Error(stderr.trim() || "Password generator failed."));
-      }
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  const requestId = randomUUID();
+  const respond = (
+    body: unknown,
+    status = 200,
+    headers: Record<string, string> = {},
+  ): NextResponse =>
+    NextResponse.json(body, {
+      status,
+      headers: {
+        "Cache-Control": "no-store, max-age=0",
+        "X-Content-Type-Options": "nosniff",
+        "X-Request-Id": requestId,
+        ...headers,
+      },
     });
 
-    child.on("error", (error) => {
-      reject(error);
-    });
-  });
-}
+  const config = await getRuntimeConfig();
+  const rate = checkRateLimit(
+    `generate:${clientKey(request)}`,
+    config.limits.requestsPerMinute,
+  );
+  if (!rate.allowed) {
+    return respond(
+      { error: "Too many requests. Please wait a moment and try again." },
+      429,
+      { "Retry-After": String(rate.retryAfterSeconds) },
+    );
+  }
 
-export async function POST(request: NextRequest) {
-  let payload: Payload;
+  let payload: Record<string, unknown>;
   try {
-    payload = (await request.json()) as Payload;
+    const parsed: unknown = await request.json();
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return respond({ error: "Invalid JSON body." }, 400);
+    }
+    payload = parsed as Record<string, unknown>;
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return respond({ error: "Invalid JSON body." }, 400);
   }
 
   const mode = payload.mode === "words" ? "words" : "characters";
-  const args: string[] = [];
+  if (mode === "characters" && !config.features.characters) {
+    return respond({ error: "Character password generation is disabled by policy." }, 403);
+  }
+  if (mode === "words" && !config.features.passphrase) {
+    return respond({ error: "Passphrase generation is disabled by policy." }, 403);
+  }
 
-  // Common flag
-  const excludeAmbiguous = sanitizeBoolean(payload.excludeAmbiguous, false);
-  if (excludeAmbiguous) {
+  const args: string[] = [];
+  if (booleanValue(payload.excludeAmbiguous, false)) {
     args.push("--exclude-ambiguous");
   }
 
+  let expectedLength: number | null = null;
+
   if (mode === "characters") {
-    const characterPayload = payload as CharacterPayload;
-    const length = sanitizeNumber(characterPayload.length, "length");
-    const specialCount = sanitizeNumber(characterPayload.specialCount, "specialCount");
-    const digitCount = sanitizeNumber(characterPayload.digitCount, "digitCount");
-    const mixedCaseCount = sanitizeNumber(
-      characterPayload.mixedCaseCount,
-      "mixedCaseCount",
+    const length = numberWithin(
+      payload.length,
+      config.limits.lengthMin,
+      config.limits.lengthMax,
+      16,
+    );
+    const specialCount = numberWithin(
+      payload.specialCount,
+      0,
+      config.limits.specialCountMax,
+      2,
+    );
+    const digitCount = numberWithin(payload.digitCount, 0, config.limits.digitCountMax, 2);
+    const mixedCaseCount = numberWithin(
+      payload.mixedCaseCount,
+      0,
+      config.limits.mixedCaseCountMax,
+      6,
     );
 
     if (specialCount + digitCount + mixedCaseCount > length) {
-      return NextResponse.json(
-        { error: "Sum of selected character counts cannot exceed total length." },
-        { status: 400 },
+      return respond(
+        {
+          error:
+            "The sum of special, digit and mixed-case counts cannot exceed the total length.",
+        },
+        400,
       );
     }
 
-    args.push("--length", String(length));
-    args.push("--special-count", String(specialCount));
-    args.push("--digit-count", String(digitCount));
-    args.push("--mixed-case-count", String(mixedCaseCount));
+    args.push(
+      "--length",
+      String(length),
+      "--special-count",
+      String(specialCount),
+      "--digit-count",
+      String(digitCount),
+      "--mixed-case-count",
+      String(mixedCaseCount),
+    );
+    expectedLength = length;
   } else {
-    const passphrasePayload = payload as PassphrasePayload;
-    const wordCount = sanitizeNumber(passphrasePayload.wordCount, "wordCount");
-    const passphraseDigitCount = sanitizeNumber(
-      passphrasePayload.passphraseDigitCount,
-      "passphraseDigitCount",
+    const wordCount = numberWithin(
+      payload.wordCount,
+      config.limits.wordCountMin,
+      config.limits.wordCountMax,
+      4,
     );
-    const passphraseSpecialCount = sanitizeNumber(
-      passphrasePayload.passphraseSpecialCount,
-      "passphraseSpecialCount",
+    const passphraseDigitCount = numberWithin(payload.passphraseDigitCount, 0, 32, 2);
+    const passphraseSpecialCount = numberWithin(payload.passphraseSpecialCount, 0, 32, 1);
+    const passphraseMixedCount = numberWithin(
+      payload.passphraseMixedCount,
+      0,
+      config.limits.mixedCaseCountMax,
+      2,
     );
-    const passphraseMixedCount = sanitizeNumber(
-      passphrasePayload.passphraseMixedCount,
-      "passphraseMixedCount",
-    );
-    const randomizeWordCapitalization = sanitizeBoolean(
-      passphrasePayload.randomizeWordCapitalization,
-      true,
-    );
-    const separator = sanitizeSeparator(passphrasePayload.wordSeparator);
+    const separator = sanitizeSeparator(payload.wordSeparator);
+    const randomize = booleanValue(payload.randomizeWordCapitalization, true);
 
-    args.push("--use-words");
-    args.push("--word-count", String(wordCount));
-    args.push("--word-separator", separator);
-    args.push("--passphrase-digit-count", String(passphraseDigitCount));
-    args.push("--passphrase-special-count", String(passphraseSpecialCount));
-    args.push("--passphrase-mixed-count", String(passphraseMixedCount));
+    args.push(
+      "--use-words",
+      "--word-count",
+      String(wordCount),
+      "--word-separator",
+      separator,
+      "--passphrase-digit-count",
+      String(passphraseDigitCount),
+      "--passphrase-special-count",
+      String(passphraseSpecialCount),
+      "--passphrase-mixed-count",
+      String(passphraseMixedCount),
+    );
+    args.push(randomize ? "--randomize-word-case" : "--no-randomize-word-case");
 
-    if (randomizeWordCapitalization) {
-      args.push("--randomize-word-case");
-    } else {
-      args.push("--no-randomize-word-case");
+    if (config.wordlist.enforcement !== "off") {
+      const wordlist = await verifyWordlist(config.wordlist.enforcement);
+      if (wordlist.state === "mismatch" || wordlist.state === "error") {
+        if (config.wordlist.enforcement === "enforce") {
+          return respond(
+            {
+              error:
+                "Passphrase generation is temporarily unavailable because the word list failed its integrity check.",
+            },
+            503,
+          );
+        }
+        console.warn(
+          `[generate] word list integrity check failed (${wordlist.state}): ${
+            wordlist.error ?? "SHA-256 mismatch"
+          }`,
+        );
+      }
     }
   }
 
-  try {
-    const password = await invokePython(args);
-    return NextResponse.json({ password });
-  } catch (error) {
-    console.error("Password generation failed", error);
-    return NextResponse.json(
-      { error: "Unable to generate password at this time." },
-      { status: 500 },
-    );
+  const result = await runGenerator(args, 10_000);
+  if (!result.ok) {
+    console.error("[generate] generator failure", {
+      code: result.code,
+      message: result.message,
+    });
+    return respond({ error: "Unable to generate a password at this time." }, 500);
   }
+
+  const password = result.password;
+  if (!/^[\x20-\x7E]+$/.test(password)) {
+    console.error("[generate] generator returned non-printable output");
+    return respond({ error: "Unable to generate a password at this time." }, 500);
+  }
+  if (expectedLength !== null && password.length !== expectedLength) {
+    console.error("[generate] generator length mismatch", {
+      expected: expectedLength,
+      actual: password.length,
+    });
+    return respond({ error: "Unable to generate a password at this time." }, 500);
+  }
+
+  return respond({
+    password,
+    meta: {
+      mode,
+      length: password.length,
+      source: config.source,
+      requestId,
+    },
+  });
+}
+
+export function GET(): NextResponse {
+  return NextResponse.json(
+    { error: "Method not allowed. Use POST." },
+    {
+      status: 405,
+      headers: {
+        Allow: "POST",
+        "Cache-Control": "no-store",
+      },
+    },
+  );
 }

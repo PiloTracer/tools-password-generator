@@ -1,0 +1,16 @@
+{
+  "name": "@pwdgen/secrets-manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AWS Secrets Manager compatible API endpoint (AWS JSON 1.1 + SigV4) for the password generator stack.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "cli": "node cli.mjs",
+    "seed": "node seed.mjs"
+  },
+  "license": "MIT"
+}

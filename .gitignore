@@ -432,3 +432,29 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# === Password Generator stack (added) ===
+# Local environment files hold real credentials and must never be committed.
+# Only the placeholder reference (.env.example) is tracked.
+.env.*
+!.env.example
+
+# TLS private material and runtime secrets (defense in depth).
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets-manager/.data/
+
+/backups/
+/.run/
+*.local
+password/.next/
+password/node_modules/
+# ./bin holds source control scripts, not build output (the generic [Bb]in/
+# rule above would otherwise hide them).
+!/bin/
+!/bin/*.sh
+**/tmp
+**/temp

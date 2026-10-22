@@ -1,0 +1,784 @@
+openapi: 3.1.0
+info:
+  title: AWS-compatible Secrets Manager API
+  version: 1.0.0
+  summary: AWS Secrets Manager JSON 1.1 + SigV4 endpoint for client applications.
+  description: |
+    A local AWS Secrets Manager compatible service.
+
+    All operations use a single `POST /` endpoint and are selected with the
+    `X-Amz-Target: secretsmanager.<Operation>` header. Requests must be signed
+    with AWS Signature Version 4 (`AWS4-HMAC-SHA256`). Responses and errors use
+    the AWS JSON 1.1 envelopes.
+
+    Because the operation is selected by a header rather than a URL, the
+    `x-aws-target-map` extension at the bottom of this document maps each
+    target to its request and response schema.
+
+    See `API.md` for the full prose reference and `bin/verify-secrets-manager.sh`
+    for an executable compatibility test.
+  license:
+    name: MIT
+servers:
+  - url: https://secrets.agiolab.com
+    description: Public production endpoint (host nginx TLS on port 443)
+  - url: http://127.0.0.1:18001
+    description: Host loopback endpoint for administration (not public)
+  - url: http://secrets-manager:8080
+    description: Internal Docker Compose network
+tags:
+  - name: Operations
+    description: AWS Secrets Manager JSON 1.1 operations
+  - name: Health
+    description: Unauthenticated liveness and readiness probes
+
+paths:
+  /:
+    post:
+      tags: [Operations]
+      operationId: secretsManagerOperation
+      summary: Dispatch an AWS Secrets Manager operation
+      description: |
+        The body is a JSON object with the fields for the selected operation.
+        The request must include a `Host`-signed AWS SigV4 `Authorization`
+        header, `X-Amz-Date`, and the operation target. `X-Amz-Content-SHA256`
+        is accepted and verified when present.
+      parameters:
+        - name: X-Amz-Target
+          in: header
+          required: true
+          description: Operation selector.
+          schema:
+            type: string
+            enum:
+              - secretsmanager.BatchGetSecretValue
+              - secretsmanager.CreateSecret
+              - secretsmanager.DeleteSecret
+              - secretsmanager.DescribeSecret
+              - secretsmanager.GetRandomPassword
+              - secretsmanager.GetSecretValue
+              - secretsmanager.ListSecretVersionIds
+              - secretsmanager.ListSecrets
+              - secretsmanager.PutSecretValue
+              - secretsmanager.RestoreSecret
+              - secretsmanager.TagResource
+              - secretsmanager.UntagResource
+              - secretsmanager.UpdateSecret
+        - name: X-Amz-Date
+          in: header
+          required: true
+          description: UTC timestamp in `YYYYMMDDTHHMMSSZ` form.
+          schema:
+            type: string
+            pattern: '^[0-9]{8}T[0-9]{6}Z$'
+        - name: X-Amz-Content-SHA256
+          in: header
+          required: false
+          description: Hex SHA-256 of the body, or `UNSIGNED-PAYLOAD`.
+          schema:
+            type: string
+        - name: X-Amz-Security-Token
+          in: header
+          required: false
+          description: Optional session token when configured on the server.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/x-amz-json-1.1:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/BatchGetSecretValueRequest'
+                - $ref: '#/components/schemas/CreateSecretRequest'
+                - $ref: '#/components/schemas/DeleteSecretRequest'
+                - $ref: '#/components/schemas/DescribeSecretRequest'
+                - $ref: '#/components/schemas/GetRandomPasswordRequest'
+                - $ref: '#/components/schemas/GetSecretValueRequest'
+                - $ref: '#/components/schemas/ListSecretVersionIdsRequest'
+                - $ref: '#/components/schemas/ListSecretsRequest'
+                - $ref: '#/components/schemas/PutSecretValueRequest'
+                - $ref: '#/components/schemas/RestoreSecretRequest'
+                - $ref: '#/components/schemas/TagResourceRequest'
+                - $ref: '#/components/schemas/UntagResourceRequest'
+                - $ref: '#/components/schemas/UpdateSecretRequest'
+      responses:
+        '200':
+          description: Operation result
+          headers:
+            x-amzn-RequestId:
+              description: Request identifier.
+              schema:
+                type: string
+          content:
+            application/x-amz-json-1.1:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/BatchGetSecretValueResponse'
+                  - $ref: '#/components/schemas/CreateSecretResponse'
+                  - $ref: '#/components/schemas/DeleteSecretResponse'
+                  - $ref: '#/components/schemas/DescribeSecretResponse'
+                  - $ref: '#/components/schemas/GetRandomPasswordResponse'
+                  - $ref: '#/components/schemas/GetSecretValueResponse'
+                  - $ref: '#/components/schemas/ListSecretVersionIdsResponse'
+                  - $ref: '#/components/schemas/ListSecretsResponse'
+                  - $ref: '#/components/schemas/PutSecretValueResponse'
+                  - $ref: '#/components/schemas/RestoreSecretResponse'
+                  - $ref: '#/components/schemas/TagResourceResponse'
+                  - $ref: '#/components/schemas/UntagResourceResponse'
+                  - $ref: '#/components/schemas/UpdateSecretResponse'
+        '400':
+          $ref: '#/components/responses/ClientError'
+        '403':
+          $ref: '#/components/responses/SignatureError'
+        '500':
+          $ref: '#/components/responses/ServerError'
+      security:
+        - sigv4: []
+
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: healthz
+      summary: Liveness probe
+      description: Unauthenticated. Never returns secret material.
+      security: []
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /readyz:
+    get:
+      tags: [Health]
+      operationId: readyz
+      summary: Readiness probe
+      description: |
+        Unauthenticated. Returns 503 when the data directory is not writable,
+        the master key is not loaded, or the store is not initialized.
+      security: []
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '503':
+          description: Service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+
+components:
+  securitySchemes:
+    sigv4:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        AWS Signature Version 4 header authentication.
+
+        The value has the form
+        `AWS4-HMAC-SHA256 Credential=<key>/<date>/<region>/secretsmanager/aws4_request, SignedHeaders=<...>, Signature=<hex>`.
+        `SignedHeaders` must include `host`. This security scheme is an
+        OpenAPI approximation; the exact canonicalisation rules are described
+        in `API.md`.
+
+  responses:
+    ClientError:
+      description: Client error (`ResourceNotFoundException`, `InvalidParameterException`, etc.)
+      headers:
+        x-amzn-RequestId:
+          schema:
+            type: string
+        x-amzn-ErrorType:
+          schema:
+            type: string
+      content:
+        application/x-amz-json-1.1:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            __type: ResourceNotFoundException
+            message: Secrets Manager can't find the specified secret.
+    SignatureError:
+      description: Signature, credential or clock error.
+      content:
+        application/x-amz-json-1.1:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            __type: InvalidSignatureException
+            message: The request signature we calculated does not match the signature you provided.
+    ServerError:
+      description: Unexpected server error.
+      content:
+        application/x-amz-json-1.1:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    Tag:
+      type: object
+      required: [Key]
+      properties:
+        Key:
+          type: string
+          minLength: 1
+          maxLength: 128
+        Value:
+          type: string
+          maxLength: 256
+
+    Filter:
+      type: object
+      required: [Key, Values]
+      properties:
+        Key:
+          type: string
+          enum: [description, name, tag-key, tag-value, all]
+        Values:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items:
+            type: string
+
+    VersionInfo:
+      type: object
+      properties:
+        VersionId:
+          type: string
+          format: uuid
+        VersionStages:
+          type: array
+          items:
+            type: string
+        CreatedDate:
+          type: number
+          description: Epoch seconds.
+
+    SecretListEntry:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        Description:
+          type: string
+        CreatedDate:
+          type: number
+        LastChangedDate:
+          type: number
+        LastAccessedDate:
+          type: number
+        DeletedDate:
+          type: number
+        Tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+        SecretVersionsToStages:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+
+    SecretValueEntry:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        VersionId:
+          type: string
+        VersionStages:
+          type: array
+          items:
+            type: string
+        CreatedDate:
+          type: number
+        SecretString:
+          type: string
+        SecretBinary:
+          type: string
+          description: Base64 encoded binary value.
+
+    BatchError:
+      type: object
+      properties:
+        SecretId:
+          type: string
+        ErrorCode:
+          type: string
+        ErrorMessage:
+          type: string
+
+    ErrorResponse:
+      type: object
+      required: [__type]
+      properties:
+        __type:
+          type: string
+        message:
+          type: string
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: ok
+        service:
+          type: string
+        version:
+          type: string
+        authRequired:
+          type: boolean
+        time:
+          type: string
+          format: date-time
+
+    ReadyResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        ok:
+          type: boolean
+        secrets:
+          type: integer
+        deletedSecrets:
+          type: integer
+        dataDir:
+          type: string
+        writable:
+          type: boolean
+        masterKeySource:
+          type: string
+
+    CreateSecretRequest:
+      type: object
+      required: [Name]
+      properties:
+        Name:
+          type: string
+          pattern: '^[A-Za-z0-9/_+=.@-]{1,512}$'
+        Description:
+          type: string
+        SecretString:
+          type: string
+          maxLength: 65536
+        SecretBinary:
+          type: string
+          description: Base64 encoded; maximum 65536 decoded bytes.
+        KmsKeyId:
+          type: string
+          description: Stored as metadata; the local master key is used for encryption.
+        Tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+        ClientRequestToken:
+          type: string
+          pattern: '^[A-Za-z0-9-]{1,64}$'
+        VersionStages:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+      example:
+        Name: app/dev/example
+        Description: Example secret
+        SecretString: s3cr3t
+        Tags:
+          - Key: team
+            Value: platform
+
+    CreateSecretResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        VersionId:
+          type: string
+        VersionStages:
+          type: array
+          items:
+            type: string
+
+    PutSecretValueRequest:
+      type: object
+      required: [SecretId]
+      properties:
+        SecretId:
+          type: string
+        SecretString:
+          type: string
+        SecretBinary:
+          type: string
+        VersionStages:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+        ClientRequestToken:
+          type: string
+
+    PutSecretValueResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        VersionId:
+          type: string
+        VersionStages:
+          type: array
+          items:
+            type: string
+
+    GetSecretValueRequest:
+      type: object
+      required: [SecretId]
+      properties:
+        SecretId:
+          type: string
+        VersionId:
+          type: string
+        VersionStage:
+          type: string
+          default: AWSCURRENT
+
+    GetSecretValueResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        VersionId:
+          type: string
+        VersionStages:
+          type: array
+          items:
+            type: string
+        CreatedDate:
+          type: number
+        SecretString:
+          type: string
+        SecretBinary:
+          type: string
+
+    DescribeSecretRequest:
+      type: object
+      required: [SecretId]
+      properties:
+        SecretId:
+          type: string
+
+    DescribeSecretResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        Description:
+          type: string
+        CreatedDate:
+          type: number
+        LastChangedDate:
+          type: number
+        LastAccessedDate:
+          type: number
+        DeletedDate:
+          type: number
+        Tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+        VersionIdsToStages:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        RotationEnabled:
+          type: boolean
+        KmsKeyId:
+          type: string
+
+    ListSecretsRequest:
+      type: object
+      properties:
+        MaxResults:
+          type: integer
+          minimum: 1
+          maximum: 100
+        NextToken:
+          type: string
+        Filters:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/Filter'
+        IncludePlannedDeletion:
+          type: boolean
+
+    ListSecretsResponse:
+      type: object
+      properties:
+        SecretList:
+          type: array
+          items:
+            $ref: '#/components/schemas/SecretListEntry'
+        NextToken:
+          type: string
+
+    ListSecretVersionIdsRequest:
+      type: object
+      required: [SecretId]
+      properties:
+        SecretId:
+          type: string
+        MaxResults:
+          type: integer
+          minimum: 1
+          maximum: 100
+        NextToken:
+          type: string
+        IncludeDeprecated:
+          type: boolean
+
+    ListSecretVersionIdsResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        Versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionInfo'
+        NextToken:
+          type: string
+
+    UpdateSecretRequest:
+      type: object
+      required: [SecretId]
+      properties:
+        SecretId:
+          type: string
+        Description:
+          type: string
+        KmsKeyId:
+          type: string
+        SecretString:
+          type: string
+        SecretBinary:
+          type: string
+
+    UpdateSecretResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        VersionId:
+          type: string
+        VersionStages:
+          type: array
+          items:
+            type: string
+
+    DeleteSecretRequest:
+      type: object
+      required: [SecretId]
+      properties:
+        SecretId:
+          type: string
+        RecoveryWindowInDays:
+          type: integer
+          minimum: 7
+          maximum: 30
+          description: Mutually exclusive with ForceDeleteWithoutRecovery.
+        ForceDeleteWithoutRecovery:
+          type: boolean
+          description: Mutually exclusive with RecoveryWindowInDays.
+      oneOf:
+        - required: [RecoveryWindowInDays]
+        - required: [ForceDeleteWithoutRecovery]
+
+    DeleteSecretResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+        DeletionDate:
+          type: number
+
+    RestoreSecretRequest:
+      type: object
+      required: [SecretId]
+      properties:
+        SecretId:
+          type: string
+
+    RestoreSecretResponse:
+      type: object
+      properties:
+        ARN:
+          type: string
+        Name:
+          type: string
+
+    TagResourceRequest:
+      type: object
+      required: [SecretId, Tags]
+      properties:
+        SecretId:
+          type: string
+        Tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+
+    TagResourceResponse:
+      type: object
+      additionalProperties: false
+
+    UntagResourceRequest:
+      type: object
+      required: [SecretId, TagKeys]
+      properties:
+        SecretId:
+          type: string
+        TagKeys:
+          type: array
+          minItems: 1
+          items:
+            type: string
+
+    UntagResourceResponse:
+      type: object
+      additionalProperties: false
+
+    BatchGetSecretValueRequest:
+      type: object
+      properties:
+        SecretIdList:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+        Filters:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/Filter'
+        MaxResults:
+          type: integer
+          minimum: 1
+          maximum: 20
+        NextToken:
+          type: string
+
+    BatchGetSecretValueResponse:
+      type: object
+      properties:
+        SecretValues:
+          type: array
+          items:
+            $ref: '#/components/schemas/SecretValueEntry'
+        NextToken:
+          type: string
+        Errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchError'
+
+    GetRandomPasswordRequest:
+      type: object
+      properties:
+        PasswordLength:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 32
+        ExcludeCharacters:
+          type: string
+        ExcludeNumbers:
+          type: boolean
+        ExcludePunctuation:
+          type: boolean
+        ExcludeUppercase:
+          type: boolean
+        ExcludeLowercase:
+          type: boolean
+        RequireEachIncludedType:
+          type: boolean
+          default: true
+
+    GetRandomPasswordResponse:
+      type: object
+      properties:
+        RandomPassword:
+          type: string
+
+x-aws-target-map:
+  secretsmanager.CreateSecret:
+    request: CreateSecretRequest
+    response: CreateSecretResponse
+  secretsmanager.PutSecretValue:
+    request: PutSecretValueRequest
+    response: PutSecretValueResponse
+  secretsmanager.GetSecretValue:
+    request: GetSecretValueRequest
+    response: GetSecretValueResponse
+  secretsmanager.DescribeSecret:
+    request: DescribeSecretRequest
+    response: DescribeSecretResponse
+  secretsmanager.ListSecrets:
+    request: ListSecretsRequest
+    response: ListSecretsResponse
+  secretsmanager.ListSecretVersionIds:
+    request: ListSecretVersionIdsRequest
+    response: ListSecretVersionIdsResponse
+  secretsmanager.UpdateSecret:
+    request: UpdateSecretRequest
+    response: UpdateSecretResponse
+  secretsmanager.DeleteSecret:
+    request: DeleteSecretRequest
+    response: DeleteSecretResponse
+  secretsmanager.RestoreSecret:
+    request: RestoreSecretRequest
+    response: RestoreSecretResponse
+  secretsmanager.TagResource:
+    request: TagResourceRequest
+    response: TagResourceResponse
+  secretsmanager.UntagResource:
+    request: UntagResourceRequest
+    response: UntagResourceResponse
+  secretsmanager.BatchGetSecretValue:
+    request: BatchGetSecretValueRequest
+    response: BatchGetSecretValueResponse
+  secretsmanager.GetRandomPassword:
+    request: GetRandomPasswordRequest
+    response: GetRandomPasswordResponse

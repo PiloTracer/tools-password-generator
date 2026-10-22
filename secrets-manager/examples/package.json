@@ -1,0 +1,13 @@
+{
+  "name": "secrets-manager-aws-sdk-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Example AWS SDK v3 client for the AWS-compatible Secrets Manager endpoint.",
+  "scripts": {
+    "start": "node aws-sdk-v3.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0"
+  }
+}
