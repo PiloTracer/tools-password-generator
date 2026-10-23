@@ -16,6 +16,13 @@ function isAdmin(principal) {
 }
 
 /** @param {Principal|null|undefined} principal */
+function assertAdmin(principal) {
+  if (!isAdmin(principal)) {
+    throw accessDenied("Only the instance administrator can manage client credentials.");
+  }
+}
+
+/** @param {Principal|null|undefined} principal */
 function allowedPrefixes(principal) {
   return Array.isArray(principal?.allowedPrefixes)
     ? principal.allowedPrefixes.filter((prefix) => typeof prefix === "string" && prefix.length > 0)
@@ -68,9 +75,17 @@ function scopePrefixes(principal) {
 const HANDLERS = Object.freeze({
   BatchGetSecretValue: (store, input, principal) =>
     store.batchGetSecretValue(input, scopePrefixes(principal)),
+  CreateClientCredential: (store, input, principal) => {
+    assertAdmin(principal);
+    return store.createClientCredential(input, principal?.name || "instance-admin");
+  },
   CreateSecret: (store, input, principal) => {
     assertNameAllowed(input.Name, principal);
     return store.createSecret(input);
+  },
+  DeleteClientCredential: (store, input, principal) => {
+    assertAdmin(principal);
+    return store.deleteClientCredential(input);
   },
   DeleteSecret: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
@@ -80,6 +95,10 @@ const HANDLERS = Object.freeze({
     assertSecretAllowed(store, input, principal);
     return store.describeSecret(input);
   },
+  GetClientCredential: (store, input, principal) => {
+    assertAdmin(principal);
+    return store.getClientCredential(input);
+  },
   GetRandomPassword: (store, input) => store.getRandomPassword(input),
   GetSecretValue: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
@@ -88,6 +107,10 @@ const HANDLERS = Object.freeze({
   ListSecretVersionIds: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
     return store.listSecretVersionIds(input);
+  },
+  ListClientCredentials: (store, _input, principal) => {
+    assertAdmin(principal);
+    return store.listClientCredentials();
   },
   ListSecrets: (store, input, principal) =>
     store.listSecrets(input, scopePrefixes(principal)),

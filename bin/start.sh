@@ -146,11 +146,11 @@ Commands:
   restore <path>       Restore a bundle (.tar.gz) or staging directory
   backups <sub>        list | verify | prune
   cleanup <scope>      containers | volumes | images | backups | all | dangling
-  credentials [client] [--json]
-                       Show scoped client credentials for the current env
+  credentials [sub]    list | show <name> | create <name> | delete <name>
+                       Scoped client credentials (--json, --description, --prefixes)
   secrets <sub>        list | get | put | create | describe | delete |
                        seed | test | verify | endpoint | random | raw |
-                       credentials [client] [--json]
+                       credentials [list|show|create|delete] ...
   shell [service]      Shell in app (default) or secrets-manager
   exec <cmd...>        Run a command in the app container
   test-cli             Test password_generator.py (host or container)
@@ -181,8 +181,9 @@ Examples:
   ./bin/start.sh backup prd --retention 10
   ./bin/start.sh restore prd backups/prd/backup-prd-20250101T000000Z.tar.gz
   ./bin/start.sh secrets prd test
-  ./bin/start.sh secrets prd credentials acb
-  ./bin/start.sh credentials prd acb --json
+  ./bin/start.sh credentials prd list
+  ./bin/start.sh credentials prd create acme --description "ACME billing"
+  ./bin/start.sh credentials prd show acb
   ./bin/start.sh secrets dev verify --sdk --boto3
   ./bin/start.sh check-env
   ./bin/start.sh cleanup dev volumes --yes
@@ -2008,8 +2009,10 @@ action_secrets_endpoint() {
     export AWS_SECRET_ACCESS_KEY=<value from $(basename "$ENV_FILE")>
     export AWS_REGION=$SECRETS_MANAGER_REGION
 
-  Scoped client credentials (ACB):
-    ./bin/start.sh credentials $APP_ENV_RESOLVED acb
+  Scoped client credentials (static and runtime-managed):
+    ./bin/start.sh credentials $APP_ENV_RESOLVED list
+    ./bin/start.sh credentials $APP_ENV_RESOLVED create <name> --description "..."
+    ./bin/start.sh credentials $APP_ENV_RESOLVED show <name>
 EOF
 }
 
@@ -2032,10 +2035,22 @@ action_secrets_raw() {
   sm_cli raw "$operation" "$payload"
 }
 
-# Print the selected client's SigV4 credentials. This intentionally writes the
-# secret to stdout; it never writes to a log file.
-action_client_credentials() {
-  local client="${1:-acb}" json="${2:-false}" endpoint=""
+# ---------------------------------------------------------------------------
+# Client credentials (static SM_CLIENTS_JSON + runtime-managed)
+# ---------------------------------------------------------------------------
+client_endpoint_url() {
+  if [ "$APP_ENV_RESOLVED" = "prd" ]; then
+    printf '%s' "${SECRETS_MANAGER_PUBLIC_URL:-https://$SECRETS_MANAGER_HOST}"
+  else
+    printf 'http://%s:%s' \
+      "${SECRETS_MANAGER_BIND_ADDRESS:-127.0.0.1}" \
+      "${SECRETS_MANAGER_PORT:-18001}"
+  fi
+}
+
+# Emit one static client (from SM_CLIENTS_JSON) as a JSON record.
+client_record_from_env() {
+  local wanted="${1:-}"
   if [ -z "${SM_CLIENTS_JSON:-}" ]; then
     err "No SM_CLIENTS_JSON in $(basename "$ENV_FILE"). Add the client credential first."
     return 1
@@ -2044,19 +2059,11 @@ action_client_credentials() {
     err "python3 is required to read SM_CLIENTS_JSON."
     return 1
   fi
-
-  if [ "$APP_ENV_RESOLVED" = "prd" ]; then
-    endpoint="${SECRETS_MANAGER_PUBLIC_URL:-https://$SECRETS_MANAGER_HOST}"
-  else
-    endpoint="http://${SECRETS_MANAGER_BIND_ADDRESS:-127.0.0.1}:${SECRETS_MANAGER_PORT:-18001}"
-  fi
-
-  warn "The following output contains a secret. Do not paste it into logs, tickets or chat."
-  python3 - "$SM_CLIENTS_JSON" "$client" "$json" "$endpoint" "$SECRETS_MANAGER_REGION" <<'PYCLIENT'
+  python3 - "$SM_CLIENTS_JSON" "$wanted" <<'PYCLIENT'
 import json
 import sys
 
-raw, wanted, mode, endpoint, region = sys.argv[1:6]
+raw, wanted = sys.argv[1:3]
 try:
     entries = json.loads(raw)
 except json.JSONDecodeError as exc:
@@ -2066,30 +2073,134 @@ if not isinstance(entries, list):
     print("SM_CLIENTS_JSON must be a JSON array.", file=sys.stderr)
     sys.exit(1)
 
-names = [str(entry.get("name") or entry.get("accessKeyId") or "?") for entry in entries if isinstance(entry, dict)]
+names = [
+    str(entry.get("name") or entry.get("accessKeyId") or "?")
+    for entry in entries
+    if isinstance(entry, dict)
+]
 entry = next(
     (
         item
         for item in entries
         if isinstance(item, dict)
-        and (str(item.get("name", "")) == wanted or str(item.get("accessKeyId", "")) == wanted)
+        and (
+            str(item.get("name", "")) == wanted
+            or str(item.get("accessKeyId", "")) == wanted
+        )
     ),
     None,
 )
 if entry is None:
-    print(f"Client '{wanted}' not found. Available: {', '.join(names) or '(none)'}", file=sys.stderr)
+    print(
+        f"Client '{wanted}' not found in SM_CLIENTS_JSON. "
+        f"Available static clients: {', '.join(names) or '(none)'}. "
+        "Managed clients require the Secrets Manager to be running.",
+        file=sys.stderr,
+    )
     sys.exit(2)
-
 if not entry.get("accessKeyId") or not entry.get("secretAccessKey"):
-    print(f"Client '{wanted}' is missing accessKeyId or secretAccessKey.", file=sys.stderr)
+    print(
+        f"Client '{wanted}' is missing accessKeyId or secretAccessKey.",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
+record = {
+    "Name": str(entry.get("name") or entry.get("accessKeyId")),
+    "AccessKeyId": str(entry["accessKeyId"]),
+    "SecretAccessKey": str(entry["secretAccessKey"]),
+    "SessionToken": str(entry.get("sessionToken") or ""),
+    "Description": str(entry.get("description") or ""),
+    "AllowedPrefixes": [
+        str(prefix) for prefix in (entry.get("allowedPrefixes") or [])
+    ],
+    "Source": "static",
+}
+print(json.dumps(record))
+PYCLIENT
+}
+
+# Emit every static client (metadata only) as a list response.
+client_list_from_env() {
+  if ! has python3; then
+    err "python3 is required to read SM_CLIENTS_JSON."
+    return 1
+  fi
+  python3 - "${SM_CLIENTS_JSON:-[]}" <<'PYCLIENT'
+import json
+import sys
+
+try:
+    entries = json.loads(sys.argv[1] or "[]")
+except json.JSONDecodeError as exc:
+    print(f"SM_CLIENTS_JSON is not valid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(entries, list):
+    print("SM_CLIENTS_JSON must be a JSON array.", file=sys.stderr)
+    sys.exit(1)
+
+clients = []
+for entry in entries:
+    if not isinstance(entry, dict):
+        print("SM_CLIENTS_JSON entries must be objects.", file=sys.stderr)
+        sys.exit(1)
+    access_key_id = str(entry.get("accessKeyId") or "")
+    name = str(entry.get("name") or access_key_id or "?")
+    if not access_key_id or not entry.get("secretAccessKey"):
+        print(
+            f"Client '{name}' is missing accessKeyId or secretAccessKey.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    clients.append(
+        {
+            "Name": name,
+            "AccessKeyId": access_key_id,
+            "Description": str(entry.get("description") or ""),
+            "AllowedPrefixes": [
+                str(prefix) for prefix in (entry.get("allowedPrefixes") or [])
+            ],
+            "Source": "static",
+        }
+    )
+clients.sort(key=lambda item: item["Name"])
+print(json.dumps({"ClientCredentialList": clients, "StaticOnly": True}))
+PYCLIENT
+}
+
+# Print the selected client's SigV4 credentials in shell or JSON form. This
+# intentionally writes the secret to stdout; it never writes to a log file.
+format_client_credentials() {
+  local record="$1" json="${2:-false}" endpoint="$3" region="$4"
+  python3 - "$record" "$json" "$endpoint" "$region" <<'PYCLIENT'
+import json
+import re
+import sys
+
+record, mode, endpoint, region = sys.argv[1:5]
+try:
+    client = json.loads(record)
+except json.JSONDecodeError as exc:
+    print(f"Invalid client credential payload: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not client.get("AccessKeyId") or not client.get("SecretAccessKey"):
+    print(
+        "The client credential payload is missing AccessKeyId or SecretAccessKey.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+name = str(client.get("Name") or client.get("AccessKeyId") or "client")
+prefix = re.sub(r"[^A-Za-z0-9]", "_", name).upper().strip("_") or "CLIENT"
+if prefix[0].isdigit():
+    prefix = "CLIENT_" + prefix
+
 values = {
-    "ACB_SECRETS_AWS_ACCESS_KEY_ID": str(entry["accessKeyId"]),
-    "ACB_SECRETS_AWS_SECRET_ACCESS_KEY": str(entry["secretAccessKey"]),
-    "ACB_SECRETS_AWS_SESSION_TOKEN": str(entry.get("sessionToken") or ""),
-    "ACB_SECRETS_AWS_ENDPOINT_URL": endpoint,
-    "ACB_SECRETS_AWS_REGION": region,
+    f"{prefix}_SECRETS_AWS_ACCESS_KEY_ID": str(client["AccessKeyId"]),
+    f"{prefix}_SECRETS_AWS_SECRET_ACCESS_KEY": str(client["SecretAccessKey"]),
+    f"{prefix}_SECRETS_AWS_SESSION_TOKEN": str(client.get("SessionToken") or ""),
+    f"{prefix}_SECRETS_AWS_ENDPOINT_URL": endpoint,
+    f"{prefix}_SECRETS_AWS_REGION": region,
 }
 if mode == "true":
     print(json.dumps(values))
@@ -2097,6 +2208,201 @@ else:
     for key, value in values.items():
         print(f"{key}={value}")
 PYCLIENT
+}
+
+render_client_credentials_table() {
+  python3 - "$1" <<'PYCLIENT'
+import json
+import sys
+
+try:
+    data = json.loads(sys.argv[1])
+except json.JSONDecodeError as exc:
+    print(f"Invalid client credential list: {exc}", file=sys.stderr)
+    sys.exit(1)
+clients = data.get("ClientCredentialList")
+if not isinstance(clients, list):
+    print("The client credential list is malformed.", file=sys.stderr)
+    sys.exit(1)
+if not clients:
+    print("No client credentials configured.")
+    print("Create one with: ./bin/start.sh credentials <dev|prd> create <name>")
+    sys.exit(0)
+
+
+def text(value, limit=48):
+    value = " ".join(str(value or "-").split())
+    if len(value) > limit:
+        value = value[: limit - 3] + "..."
+    return value or "-"
+
+
+headers = ["NAME", "SOURCE", "ACCESS KEY ID", "PREFIXES", "DESCRIPTION"]
+rows = []
+for client in clients:
+    rows.append(
+        [
+            text(client.get("Name")),
+            text(client.get("Source")),
+            text(client.get("AccessKeyId")),
+            text(",".join(client.get("AllowedPrefixes") or []) or "-"),
+            text(client.get("Description") or "-"),
+        ]
+    )
+
+widths = [len(header) for header in headers]
+for row in rows:
+    for index, value in enumerate(row):
+        widths[index] = max(widths[index], len(value))
+print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)).rstrip())
+for row in rows:
+    print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
+print()
+print(f"{len(clients)} client credential(s).")
+PYCLIENT
+}
+
+action_client_credentials_list() {
+  local json="${1:-false}" raw="" output=""
+  if ! has python3; then
+    err "python3 is required to render client credentials."
+    return 1
+  fi
+  if is_running "$SECRETS_SERVICE"; then
+    if output="$(sm_cli list-client-credentials --json 2>&1)"; then
+      raw="$output"
+    else
+      case "$output" in
+        *"Unknown command 'list-client-credentials'"*)
+          warn "The running Secrets Manager image predates runtime client credentials."
+          warn "Listing static SM_CLIENTS_JSON entries only; rebuild to manage clients live."
+          if ! raw="$(client_list_from_env)"; then
+            return 1
+          fi
+          ;;
+        *)
+          err "$output"
+          return 1
+          ;;
+      esac
+    fi
+  else
+    warn "Secrets Manager is not running; listing static SM_CLIENTS_JSON entries only."
+    if ! raw="$(client_list_from_env)"; then
+      return 1
+    fi
+  fi
+  if [ "$json" = true ]; then
+    printf '%s\n' "$raw" |
+      python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), indent=2))'
+  else
+    render_client_credentials_table "$raw"
+  fi
+}
+
+action_client_credentials_show() {
+  local name="${1:-}" json="${2:-false}" endpoint="" raw="" output=""
+  if [ -z "$name" ]; then
+    err "Usage: ./bin/start.sh credentials [dev|prd] show <name> [--json]"
+    return 1
+  fi
+  if ! has python3; then
+    err "python3 is required to render client credentials."
+    return 1
+  fi
+  endpoint="$(client_endpoint_url)"
+  warn "The following output contains a secret. Do not paste it into logs, tickets or chat."
+  if is_running "$SECRETS_SERVICE"; then
+    if output="$(sm_cli get-client-credential "$name" --json 2>&1)"; then
+      raw="$output"
+    else
+      case "$output" in
+        *"Unknown command 'get-client-credential'"*)
+          warn "The running Secrets Manager image predates runtime client credentials."
+          warn "Reading the static SM_CLIENTS_JSON entry only; rebuild to resolve managed clients."
+          if ! raw="$(client_record_from_env "$name")"; then
+            return 1
+          fi
+          ;;
+        *)
+          err "$output"
+          return 1
+          ;;
+      esac
+    fi
+  else
+    warn "Secrets Manager is not running; reading the static SM_CLIENTS_JSON entry only."
+    if ! raw="$(client_record_from_env "$name")"; then
+      return 1
+    fi
+  fi
+  format_client_credentials "$raw" "$json" "$endpoint" "$SECRETS_MANAGER_REGION"
+}
+
+action_client_credentials_create() {
+  local name="${1:-}" description="${2:-}" prefixes="${3:-}" access_key_id="${4:-}"
+  local json="${5:-false}" endpoint="" raw="" output="" args=()
+  if [ -z "$name" ]; then
+    err "Usage: ./bin/start.sh credentials [dev|prd] create <name> [--description TEXT] [--prefixes P1,P2] [--access-key-id ID]"
+    return 1
+  fi
+  if ! has python3; then
+    err "python3 is required to render client credentials."
+    return 1
+  fi
+  require_sm_running || return 1
+
+  args=(create-client-credential "$name" --json)
+  [ -n "$description" ] && args+=(--description "$description")
+  [ -n "$prefixes" ] && args+=(--prefixes "$prefixes")
+  [ -n "$access_key_id" ] && args+=(--access-key-id "$access_key_id")
+  if ! output="$(sm_cli "${args[@]}" 2>&1)"; then
+    err "$output"
+    err "If the running Secrets Manager image predates this script, rebuild it:"
+    err "  ./bin/start.sh up $APP_ENV_RESOLVED"
+    return 1
+  fi
+  raw="$output"
+
+  warn "Store this secret now. It is shown below and can be retrieved later with:"
+  warn "  ./bin/start.sh credentials $APP_ENV_RESOLVED show $name"
+  python3 - "$raw" <<'PYCLIENT' >&2
+import json
+import sys
+
+try:
+    client = json.loads(sys.argv[1])
+except json.JSONDecodeError as exc:
+    print(f"Invalid client credential payload: {exc}", file=sys.stderr)
+    sys.exit(1)
+print(f"Created client credential: {client.get('Name')}")
+print(f"  Description:      {client.get('Description') or '-'}")
+print(f"  Allowed prefixes: {', '.join(client.get('AllowedPrefixes') or [])}")
+print(f"  Access key id:    {client.get('AccessKeyId')}")
+PYCLIENT
+
+  endpoint="$(client_endpoint_url)"
+  format_client_credentials "$raw" "$json" "$endpoint" "$SECRETS_MANAGER_REGION"
+}
+
+action_client_credentials_delete() {
+  local name="${1:-}" output=""
+  if [ -z "$name" ]; then
+    err "Usage: ./bin/start.sh credentials [dev|prd] delete <name> [--yes]"
+    return 1
+  fi
+  require_sm_running || return 1
+  if ! confirm "Delete client credential '$name'? Its key stops working immediately." no; then
+    info "Nothing deleted."
+    return 0
+  fi
+  if ! output="$(sm_cli delete-client-credential "$name" 2>&1)"; then
+    err "$output"
+    err "If the running Secrets Manager image predates this script, rebuild it:"
+    err "  ./bin/start.sh up $APP_ENV_RESOLVED"
+    return 1
+  fi
+  ok "Client credential '$name' deleted."
 }
 
 # ---------------------------------------------------------------------------
@@ -2459,8 +2765,51 @@ EOF
   esac
 }
 
+menu_client_credentials() {
+  local choice name description prefixes access_key_id
+  cat <<'EOF'
+
+Client credentials:
+  1) List all (static + managed)
+  2) Show one (prints its secret)
+  3) Create a managed credential
+  4) Delete a managed credential
+  0) Back
+EOF
+  printf 'Select: '
+  read -r choice || return 0
+  case "$choice" in
+    1) action_client_credentials_list false ;;
+    2)
+      printf 'Client name: '
+      read -r name || return 0
+      [ -n "$name" ] && action_client_credentials_show "$name" false
+      ;;
+    3)
+      printf 'Client name: '
+      read -r name || return 0
+      [ -n "$name" ] || return 0
+      printf 'Description (optional): '
+      read -r description || return 0
+      printf 'Allowed prefixes (comma-separated, blank = client/%s/): ' "$name"
+      read -r prefixes || return 0
+      printf 'Access key id (blank = generated): '
+      read -r access_key_id || return 0
+      action_client_credentials_create \
+        "$name" "$description" "$prefixes" "$access_key_id" false
+      ;;
+    4)
+      printf 'Client name: '
+      read -r name || return 0
+      [ -n "$name" ] && action_client_credentials_delete "$name"
+      ;;
+    0|"") return 0 ;;
+    *) warn "Invalid option." ;;
+  esac
+}
+
 menu_secrets() {
-  local choice secret_id description file length sdk_choice boto3_choice with_sdk with_boto3 client
+  local choice secret_id description file length sdk_choice boto3_choice with_sdk with_boto3
   cat <<'EOF'
 
 Secrets Manager:
@@ -2475,7 +2824,7 @@ Secrets Manager:
   9) Show endpoint information
  10) Generate a random password
  11) Full AWS-substitute verification (lifecycle + optional AWS SDKs)
- 12) Show client credentials (ACB / scoped SigV4)
+ 12) Client credentials (list / show / create / delete)
   0) Back
 EOF
   printf 'Select: '
@@ -2529,11 +2878,7 @@ EOF
       case "$boto3_choice" in y|Y|yes) with_boto3=true ;; esac
       action_secrets_verify "$with_sdk" "$with_boto3"
       ;;
-    12)
-      printf 'Client name [acb]: '
-      read -r client || return 0
-      action_client_credentials "${client:-acb}"
-      ;;
+    12) menu_client_credentials ;;
     0|"") return 0 ;;
     *) warn "Invalid option." ;;
   esac
@@ -2838,19 +3183,7 @@ cmd_secrets() {
       seed_secrets "$force"
       ;;
     test) action_secrets_test ;;
-    credentials|client-credentials)
-      local client="acb" json=false
-      while [ "$#" -gt 0 ]; do
-        case "$1" in
-          --json) json=true ;;
-          --client) client="${2:-acb}"; shift ;;
-          --client=*) client="${1#--client=}" ;;
-          *) client="$1" ;;
-        esac
-        shift
-      done
-      action_client_credentials "$client" "$json"
-      ;;
+    credentials|client-credentials) cmd_client_credentials "$@" ;;
     verify)
       local with_sdk=false with_boto3=false
       while [ "$#" -gt 0 ]; do
@@ -2886,17 +3219,113 @@ cmd_secrets() {
 }
 
 cmd_client_credentials() {
-  local client="acb" json=false
+  local action="" name="" description="" prefixes="" access_key_id="" json=false
+  local positionals=0 current=""
   while [ "$#" -gt 0 ]; do
+    current="$1"
     case "$1" in
+      list|ls)
+        if [ "$positionals" -eq 0 ]; then
+          action="list"
+        elif [ -z "$name" ]; then
+          name="$1"
+        else
+          err "Unexpected argument for credentials: $1"
+          return 1
+        fi
+        ;;
+      create|add)
+        if [ "$positionals" -eq 0 ]; then
+          action="create"
+        elif [ -z "$name" ]; then
+          name="$1"
+        else
+          err "Unexpected argument for credentials: $1"
+          return 1
+        fi
+        ;;
+      show|get)
+        if [ "$positionals" -eq 0 ]; then
+          action="show"
+        elif [ -z "$name" ]; then
+          name="$1"
+        else
+          err "Unexpected argument for credentials: $1"
+          return 1
+        fi
+        ;;
+      delete|remove|rm)
+        if [ "$positionals" -eq 0 ]; then
+          action="delete"
+        elif [ -z "$name" ]; then
+          name="$1"
+        else
+          err "Unexpected argument for credentials: $1"
+          return 1
+        fi
+        ;;
       --json) json=true ;;
-      --client) client="${2:-acb}"; shift ;;
-      --client=*) client="${1#--client=}" ;;
-      *) client="$1" ;;
+      --description) description="${2:-}"; shift ;;
+      --description=*) description="${1#--description=}" ;;
+      --prefixes) prefixes="${2:-}"; shift ;;
+      --prefixes=*) prefixes="${1#--prefixes=}" ;;
+      --access-key-id) access_key_id="${2:-}"; shift ;;
+      --access-key-id=*) access_key_id="${1#--access-key-id=}" ;;
+      --client)
+        name="${2:-}"
+        shift
+        ;;
+      --client=*) name="${1#--client=}" ;;
+      --yes|-y) ASSUME_YES=true ;;
+      -*) err "Unknown option for credentials: $1"; return 1 ;;
+      *)
+        if [ -n "$name" ]; then
+          err "Unexpected argument for credentials: $1"
+          return 1
+        fi
+        name="$1"
+        ;;
     esac
+    if [ "${current#-}" = "$current" ]; then
+      positionals=$((positionals + 1))
+    fi
     shift
   done
-  action_client_credentials "$client" "$json"
+
+  if [ -z "$action" ]; then
+    if [ -n "$name" ]; then
+      action="show"
+    else
+      action="list"
+    fi
+  fi
+
+  case "$action" in
+    list) action_client_credentials_list "$json" ;;
+    show)
+      if [ -z "$name" ]; then
+        err "Usage: ./bin/start.sh credentials [dev|prd] show <name> [--json]"
+        return 1
+      fi
+      action_client_credentials_show "$name" "$json"
+      ;;
+    create)
+      if [ -z "$name" ]; then
+        err "Usage: ./bin/start.sh credentials [dev|prd] create <name> [--description TEXT] [--prefixes P1,P2] [--access-key-id ID]"
+        return 1
+      fi
+      action_client_credentials_create \
+        "$name" "$description" "$prefixes" "$access_key_id" "$json"
+      ;;
+    delete)
+      if [ -z "$name" ]; then
+        err "Usage: ./bin/start.sh credentials [dev|prd] delete <name> [--yes]"
+        return 1
+      fi
+      action_client_credentials_delete "$name"
+      ;;
+    *) err "Unknown credentials action: $action"; return 1 ;;
+  esac
 }
 
 cmd_shell() {

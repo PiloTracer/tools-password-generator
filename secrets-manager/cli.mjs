@@ -28,6 +28,10 @@ Commands:
   untag-resource <secret-id> Key [Key ...]
   get-random-password [--length N] [--json]
   batch-get <secret-id> [secret-id ...]
+  list-client-credentials [--json]
+  create-client-credential <name> [--description TEXT] [--prefixes P1,P2] [--access-key-id ID] [--json]
+  get-client-credential <name> [--json]
+  delete-client-credential <name>
   raw <Operation> [json-payload]
   ping
 
@@ -272,6 +276,48 @@ async function run(argv) {
         throw new Error("batch-get requires at least one secret id.");
       }
       printJson(await call("BatchGetSecretValue", { SecretIdList: positional }));
+      return;
+    }
+    case "list-client-credentials": {
+      printJson(await call("ListClientCredentials", {}));
+      return;
+    }
+    case "create-client-credential": {
+      if (!positional[0]) {
+        throw new Error("create-client-credential requires a client name.");
+      }
+      const payload = { Name: positional[0] };
+      if (typeof flags.description === "string") {
+        payload.Description = flags.description;
+      }
+      if (typeof flags.prefixes === "string") {
+        const prefixes = flags.prefixes
+          .split(",")
+          .map((prefix) => prefix.trim())
+          .filter(Boolean);
+        if (prefixes.length === 0) {
+          throw new Error("--prefixes requires at least one comma-separated prefix.");
+        }
+        payload.AllowedPrefixes = prefixes;
+      }
+      if (typeof flags["access-key-id"] === "string") {
+        payload.AccessKeyId = flags["access-key-id"];
+      }
+      printJson(await call("CreateClientCredential", payload));
+      return;
+    }
+    case "get-client-credential": {
+      if (!positional[0]) {
+        throw new Error("get-client-credential requires a client name.");
+      }
+      printJson(await call("GetClientCredential", { Name: positional[0] }));
+      return;
+    }
+    case "delete-client-credential": {
+      if (!positional[0]) {
+        throw new Error("delete-client-credential requires a client name.");
+      }
+      printJson(await call("DeleteClientCredential", { Name: positional[0] }));
       return;
     }
     case "raw": {

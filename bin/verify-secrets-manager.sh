@@ -10,6 +10,7 @@
 #    • soft delete -> access denied -> restore -> access,
 #    • rejected requests for a wrong secret key and a wrong region,
 #    • the bundled SigV4 client when the AWS CLI is unavailable,
+#    • the admin-only client-credential list extension,
 #    • optionally a real AWS SDK v3 client (--sdk),
 #    • optionally a real Python boto3 client (--boto3).
 #
@@ -376,6 +377,12 @@ else
   else
     fail "DeleteSecret (cleanup)"
   fi
+fi
+
+if sm_cli list-client-credentials 2>/dev/null | grep -q '"ClientCredentialList"'; then
+  pass "ListClientCredentials (admin-only extension)"
+else
+  fail "ListClientCredentials (admin-only extension)"
 fi
 
 if [ "$USE_SDK" = true ]; then

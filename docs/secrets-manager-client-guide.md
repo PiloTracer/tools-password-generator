@@ -68,6 +68,21 @@ allowed secret-name prefix; for this ACB onboarding the prefix is
 `password-generator/...` secrets, and it cannot create secrets outside
 `client/acb/`.
 
+Additional scoped clients can be created on the server at any time with an
+optional description, and managed credentials are stored encrypted and survive
+restarts:
+
+```bash
+./bin/start.sh credentials prd create <client> --description "..." --prefixes client/<client>/
+./bin/start.sh credentials prd list
+./bin/start.sh credentials prd show <client>
+```
+
+Your credential never grants access to the credential-management operations.
+Those are admin-only; a client calling `CreateClientCredential`,
+`ListClientCredentials`, `GetClientCredential` or `DeleteClientCredential`
+receives `AccessDeniedException`.
+
 The service supports multiple client credentials, but it is not IAM/STS: there
 are no roles, policies or temporary credentials. `ListSecrets` and
 `BatchGetSecretValue` are filtered to the client's prefix, and operations on
@@ -251,6 +266,11 @@ Unsupported AWS features: IAM/resource policies, KMS customer-managed keys,
 managed rotation lambdas, replication and presigned URLs. See the full API
 reference for details.
 
+The server also exposes four local, admin-only extensions for credential
+lifecycle (`CreateClientCredential`, `ListClientCredentials`,
+`GetClientCredential`, `DeleteClientCredential`). They are not part of the AWS
+API and are not available to scoped client credentials.
+
 ---
 
 ## 7. Limits
@@ -296,7 +316,7 @@ curl -fsS https://secrets.agiolab.com/healthz
 Expected:
 
 ```json
-{"status":"ok","service":"secrets-manager","version":"1.0.0","authRequired":true}
+{"status":"ok","service":"secrets-manager","version":"1.1.0","authRequired":true}
 ```
 
 `/readyz` additionally verifies the encrypted store is writable and loaded.

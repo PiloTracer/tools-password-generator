@@ -98,10 +98,14 @@ export AWS_ENDPOINT_URL_SECRETSMANAGER=http://127.0.0.1:18001
 ```
 
 > **Multiple clients, prefix-scoped.** The primary credential is full-access.
-> Additional credentials configured through `SM_CLIENTS_JSON` are limited to
-> their `allowedPrefixes`: list/batch operations are filtered, and operations on
-> other secret names return `AccessDeniedException`. This is not IAM/STS; there
-> are no policies, roles, or temporary credentials.
+> Additional credentials are limited to their `allowedPrefixes`: list/batch
+> operations are filtered, and operations on other secret names return
+> `AccessDeniedException`. Scoped clients come from `SM_CLIENTS_JSON` (static,
+> read-only at runtime) or are created through the admin-only
+> `*ClientCredential` operations (managed, encrypted in the data volume). This
+> is not IAM/STS; there are no policies, roles, or temporary credentials.
+> Only the primary credential can manage client credentials; a scoped client
+> receives `AccessDeniedException` for every `*ClientCredential` operation.
 
 Only header-based SigV4 is supported; presigned query URLs are rejected.
 
@@ -201,6 +205,13 @@ Deletion:
 - `ForceDeleteWithoutRecovery: true` removes the secret and all versions
   immediately.
 - Expired soft-deleted secrets are purged when the service starts.
+
+Client credentials are a separate registry, not secrets. Each record has a
+`Name`, `AccessKeyId`, optional `Description`, `AllowedPrefixes`, the encrypted
+`SecretAccessKey`, and either `Source: static` (`SM_CLIENTS_JSON`) or
+`Source: managed` (created by the admin API). Managed records also carry
+`CreatedDate`, `LastUpdatedDate` and `CreatedBy`. See
+[5.14](#514-listclientcredentials)–[5.17](#517-deleteclientcredential).
 
 ---
 
@@ -481,6 +492,122 @@ Response: `{ "RandomPassword": "..." }`.
 `PasswordLength` is 1–4096 (default 32). When `RequireEachIncludedType` is true,
 at least one character from every included class is guaranteed.
 
+### 5.14 ListClientCredentials
+
+**Local extension, admin-only.** Lists static (`SM_CLIENTS_JSON`) and managed
+client credentials. Request: `{}`. The response never contains secret material.
+
+```json
+{
+  "ClientCredentialList": [
+    {
+      "Name": "acb",
+      "AccessKeyId": "acb-prd-access",
+      "Description": "ACB production client",
+      "AllowedPrefixes": ["client/acb/"],
+      "Source": "static"
+    },
+    {
+      "Name": "acme",
+      "AccessKeyId": "AKIA0123456789ABCDEF",
+      "Description": "ACME billing integration",
+      "AllowedPrefixes": ["client/acme/"],
+      "Source": "managed",
+      "CreatedDate": 1730000000,
+      "LastUpdatedDate": 1730000000,
+      "CreatedBy": "instance-admin"
+    }
+  ]
+}
+```
+
+`Source` is `static` or `managed`. `CreatedDate`, `LastUpdatedDate` and
+`CreatedBy` are present only for managed entries. Static entries are read-only
+through the API.
+
+### 5.15 CreateClientCredential
+
+**Local extension, admin-only.** Creates a prefix-scoped, non-admin client.
+
+```json
+{
+  "Name": "acme",
+  "Description": "ACME billing integration",
+  "AllowedPrefixes": ["client/acme/"],
+  "AccessKeyId": "AKIACUSTOM1234567890"
+}
+```
+
+| Field | Required | Rules |
+|---|---|---|
+| `Name` | yes | 1–64 chars, starts with a letter/number, then `A-Z a-z 0-9 . _ -`; unique across static and managed clients |
+| `Description` | no | ≤512 chars |
+| `AllowedPrefixes` | no | 1–16 strings; each is normalized to end in `/`; default `client/<Name>/` |
+| `AccessKeyId` | no | 8–64 chars, starts with a letter/number, then `A-Z a-z 0-9 . _ -`; generated as `AKIA…` when omitted; unique |
+
+Response (the secret is returned here and by `GetClientCredential`):
+
+```json
+{
+  "Name": "acme",
+  "AccessKeyId": "AKIACUSTOM1234567890",
+  "SecretAccessKey": "<64 hex>",
+  "SessionToken": "",
+  "Description": "ACME billing integration",
+  "AllowedPrefixes": ["client/acme/"],
+  "Source": "managed",
+  "CreatedDate": 1730000000,
+  "LastUpdatedDate": 1730000000,
+  "CreatedBy": "instance-admin"
+}
+```
+
+`SecretAccessKey` values are generated with 32 random bytes. There is no
+temporary-credential/STS flow, so `SessionToken` is empty. Duplicate names or
+access key ids return `ResourceExistsException`; invalid fields return
+`InvalidParameterException`; non-admin callers get `AccessDeniedException`.
+Managed credentials are stored encrypted in `store.json` and survive restarts
+and volume backups.
+
+### 5.16 GetClientCredential
+
+**Local extension, admin-only.** Returns the credential including its secret.
+Identify it by `Name` or `AccessKeyId`:
+
+```json
+{ "Name": "acme" }
+```
+
+or
+
+```json
+{ "AccessKeyId": "AKIACUSTOM1234567890" }
+```
+
+The response has the same shape as `CreateClientCredential`. This is the only
+way to re-read a managed secret; `ListClientCredentials` deliberately omits it.
+Treat the response as sensitive.
+
+### 5.17 DeleteClientCredential
+
+**Local extension, admin-only.** Revokes a managed credential immediately.
+
+```json
+{ "Name": "acme" }
+```
+
+Response:
+
+```json
+{ "Name": "acme", "AccessKeyId": "AKIACUSTOM1234567890", "DeletionDate": 1730000000 }
+```
+
+Deletion is permanent (no recovery window). A request signed with the deleted
+credential fails with `UnrecognizedClientException` from the next request.
+Static `SM_CLIENTS_JSON` entries cannot be deleted: the call returns
+`InvalidRequestException`; remove the entry from the environment file and
+recreate the container instead.
+
 ---
 
 ## 6. AWS CLI examples
@@ -527,6 +654,26 @@ The control script injects the right credentials automatically:
 ./bin/start.sh secrets dev verify --sdk
 ./bin/start.sh secrets dev get password-generator/dev/app-config --json
 ```
+
+The client-credential extensions are not part of the AWS CLI command model. Use
+the bundled client/control script:
+
+```bash
+node secrets-manager/cli.mjs list-client-credentials
+node secrets-manager/cli.mjs create-client-credential acme \
+  --description "ACME billing" --prefixes client/acme/
+node secrets-manager/cli.mjs get-client-credential acme
+node secrets-manager/cli.mjs delete-client-credential acme
+
+# or, on the server:
+./bin/start.sh credentials dev list
+./bin/start.sh credentials dev create acme --description "ACME billing"
+./bin/start.sh credentials dev show acme
+./bin/start.sh credentials dev delete acme --yes
+```
+
+`create` returns the secret once; `get` returns it again for an administrator;
+`list` never returns secrets.
 
 ---
 
@@ -649,16 +796,23 @@ The policy payload is documented in the [root README](../README.md#6-aws-compati
 
   Do not strip or rewrite the request path; the signature covers it.
 
-- **Rotate credentials.** Change `SECRETS_MANAGER_SECRET_ACCESS_KEY` (or the
-  relevant `SM_CLIENTS_JSON` entry) and update every affected client. Prefer
-  distinct credentials per environment and per client.
+- **Rotate credentials.** Change `SECRETS_MANAGER_SECRET_ACCESS_KEY` and update
+  the application. Rotate a static client by editing its `SM_CLIENTS_JSON` entry
+  and recreating the container; rotate a managed client with
+  `DeleteClientCredential` followed by `CreateClientCredential`, then update the
+  client. Prefer distinct credentials per environment and per client.
 - **Protect the master key.** Values are AES-256-GCM encrypted. The key lives
   in the data volume (`/data/master.key`, mode `0600`) or comes from
   `SECRETS_MANAGER_MASTER_KEY`. Backups include it when stored in the volume —
   treat backup bundles as secrets.
 - **Limit the blast radius.** The primary credential is full-access; issue
-  scoped `SM_CLIENTS_JSON` credentials for clients. Isolate deployments or add
-  a proxy-level ACL if multiple teams share a host.
+  prefix-scoped clients (static or managed) for applications, and keep the admin
+  credential off client hosts. Managed clients are always non-admin and cannot
+  mint credentials. Isolate deployments or add a proxy-level ACL if multiple
+  teams share a host.
+- **Treat the client registry as secret.** Managed client secrets are encrypted
+  in `store.json`, covered by the same volume backup and master key as secret
+  values. `GetClientCredential` prints a secret; do not log it.
 - **Back up before rotating.** Use `./bin/start.sh backup <env>`; restore with
   `./bin/start.sh restore <env> <bundle>`.
 
@@ -677,9 +831,10 @@ SM_ENDPOINT=https://secrets.agiolab.com \
 
 The verifier checks health, SigV4 authentication, create/get/put/describe/list,
 version stages, tags, batch reads, random passwords, soft delete/restore,
-force delete, wrong-key/wrong-region rejection, and — with `--sdk` /
-`--boto3` — real `@aws-sdk/client-secrets-manager` and `boto3` clients. It
-creates a uniquely named test secret and removes it on exit.
+force delete, wrong-key/wrong-region rejection, the admin-only
+`ListClientCredentials` extension, and — with `--sdk` / `--boto3` — real
+`@aws-sdk/client-secrets-manager` and `boto3` clients. It creates a uniquely
+named test secret and removes it on exit.
 
 Alternatively use the control script:
 
@@ -717,10 +872,13 @@ Verified clients:
 - Python `boto3`
 - The bundled SigV4 client (`cli.mjs`)
 
-Supported operations: `CreateSecret`, `PutSecretValue`, `GetSecretValue`,
+Supported AWS operations: `CreateSecret`, `PutSecretValue`, `GetSecretValue`,
 `DescribeSecret`, `ListSecrets`, `ListSecretVersionIds`, `UpdateSecret`,
 `DeleteSecret`, `RestoreSecret`, `TagResource`, `UntagResource`,
 `BatchGetSecretValue`, `GetRandomPassword`.
+
+Local extensions (admin-only, not AWS APIs): `CreateClientCredential`,
+`ListClientCredentials`, `GetClientCredential`, `DeleteClientCredential`.
 
 Not implemented:
 

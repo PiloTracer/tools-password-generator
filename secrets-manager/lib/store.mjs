@@ -4,6 +4,7 @@ import path from "node:path";
 
 import {
   accessDenied,
+  clientNotFound,
   invalidParameter,
   invalidRequest,
   resourceExists,
@@ -15,6 +16,11 @@ const NAME_PATTERN = /^[a-zA-Z0-9/_+=.@-]+$/;
 const VERSION_STAGE_PATTERN = /^[a-zA-Z0-9_]+$/;
 const CLIENT_TOKEN_PATTERN = /^[a-zA-Z0-9-]{1,64}$/;
 const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+const CLIENT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ACCESS_KEY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$/;
+const MAX_CLIENT_DESCRIPTION_LENGTH = 512;
+const MAX_CLIENT_PREFIXES = 16;
+const MAX_MANAGED_CLIENTS = 100;
 
 /**
  * @param {string} name
@@ -76,6 +82,8 @@ export class SecretStore {
    *   maxSecretBytes?: number,
    *   recoveryWindowDays?: number,
    *   logger?: {info: Function, warn: Function, error: Function, debug: Function},
+   *   staticClients?: Array<Record<string, any>>,
+   *   reservedAccessKeyIds?: string[],
    * }} options
    */
   constructor(options) {
@@ -88,11 +96,31 @@ export class SecretStore {
     this.logger = options.logger;
     this.storePath = path.join(this.dataDir, "store.json");
     this.keyPath = path.join(this.dataDir, "master.key");
+    this.staticClients = Array.isArray(options.staticClients)
+      ? options.staticClients.map((client) => ({
+          name: String(client.name || client.accessKeyId || ""),
+          accessKeyId: String(client.accessKeyId || ""),
+          secretAccessKey: String(client.secretAccessKey || ""),
+          sessionToken: String(client.sessionToken || ""),
+          description: String(client.description || ""),
+          allowedPrefixes: Array.isArray(client.allowedPrefixes)
+            ? client.allowedPrefixes.map(String)
+            : [],
+        }))
+      : [];
+    this.reservedAccessKeyIds = new Set([
+      ...(Array.isArray(options.reservedAccessKeyIds)
+        ? options.reservedAccessKeyIds.map(String)
+        : []),
+      ...this.staticClients.map((client) => client.accessKeyId),
+    ]);
+    /** @type {Array<Record<string, any>>} */
+    this.managedPrincipals = [];
     /** @type {Buffer|null} */
     this.masterKey = null;
     /** @type {string} */
     this.masterKeySource = "unknown";
-    /** @type {{schemaVersion: number, createdAt: number, updatedAt?: number, secrets: Array<Record<string, any>>}|null} */
+    /** @type {{schemaVersion: number, createdAt: number, updatedAt?: number, secrets: Array<Record<string, any>>, clients: Array<Record<string, any>>}|null} */
     this.data = null;
     this.ready = false;
   }
@@ -105,6 +133,7 @@ export class SecretStore {
     fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
     this.masterKey = this.loadMasterKey();
     this.data = this.loadData();
+    this.loadManagedClients();
     const purged = this.purgeExpiredDeletions();
     if (purged > 0) {
       this.logger?.info("purged expired secret deletions", { count: purged });
@@ -151,7 +180,7 @@ export class SecretStore {
   }
 
   /**
-   * @returns {{schemaVersion: number, createdAt: number, updatedAt?: number, secrets: Array<Record<string, any>>}}
+   * @returns {{schemaVersion: number, createdAt: number, updatedAt?: number, secrets: Array<Record<string, any>>, clients: Array<Record<string, any>>}}
    */
   loadData() {
     if (!fs.existsSync(this.storePath)) {
@@ -159,6 +188,7 @@ export class SecretStore {
         schemaVersion: 1,
         createdAt: Date.now(),
         secrets: [],
+        clients: [],
       };
       this.data = initial;
       this.persist();
@@ -185,6 +215,33 @@ export class SecretStore {
         throw new Error(`The secrets store contains an invalid secret record: ${this.storePath}`);
       }
     }
+    if (parsed.clients === undefined) {
+      parsed.clients = [];
+    }
+    if (!Array.isArray(parsed.clients)) {
+      throw new Error(`The secrets store has an unexpected shape: ${this.storePath}`);
+    }
+    for (const client of parsed.clients) {
+      if (
+        !isPlainObject(client) ||
+        typeof client.name !== "string" ||
+        client.name.length === 0 ||
+        typeof client.accessKeyId !== "string" ||
+        client.accessKeyId.length === 0 ||
+        typeof client.secretCiphertext !== "string" ||
+        typeof client.createdAt !== "number" ||
+        (client.description !== undefined && typeof client.description !== "string") ||
+        !Array.isArray(client.allowedPrefixes) ||
+        client.allowedPrefixes.length === 0 ||
+        !client.allowedPrefixes.every(
+          (prefix) => typeof prefix === "string" && prefix.length > 0,
+        )
+      ) {
+        throw new Error(
+          `The secrets store contains an invalid client credential record: ${this.storePath}`,
+        );
+      }
+    }
     return parsed;
   }
 
@@ -206,6 +263,374 @@ export class SecretStore {
         }
       }
     }
+  }
+
+  /**
+   * Load managed client credentials and decrypt their secrets into memory.
+   * Fails fast if the master key is wrong or a stored credential collides with
+   * a credential supplied through SM_CLIENTS_JSON.
+   */
+  loadManagedClients() {
+    if (!Array.isArray(this.data.clients)) {
+      this.data.clients = [];
+    }
+    const knownAccessKeyIds = new Set(this.reservedAccessKeyIds);
+    const knownNames = new Set(this.staticClients.map((client) => client.name));
+    this.managedPrincipals = [];
+    for (const client of this.data.clients) {
+      if (knownAccessKeyIds.has(client.accessKeyId)) {
+        throw new Error(
+          `The stored client credential '${client.name}' conflicts with a static credential ` +
+            `(access key ${client.accessKeyId}). Remove one of them.`,
+        );
+      }
+      if (knownNames.has(client.name)) {
+        throw new Error(
+          `The stored client credential '${client.name}' conflicts with a static credential ` +
+            "of the same name. Remove one of them.",
+        );
+      }
+      let secretAccessKey;
+      try {
+        secretAccessKey = this.decrypt(client.secretCiphertext, this.buildClientAad(client));
+      } catch (error) {
+        throw new Error(
+          `Unable to decrypt client credential '${client.name}'. ` +
+            "The master key does not match this store. Restore the matching key or volume backup. " +
+            `(${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
+      this.managedPrincipals.push({
+        accessKeyId: client.accessKeyId,
+        secretAccessKey,
+        sessionToken: "",
+        name: client.name,
+        admin: false,
+        allowedPrefixes: [...client.allowedPrefixes],
+      });
+      knownAccessKeyIds.add(client.accessKeyId);
+      knownNames.add(client.name);
+    }
+  }
+
+  /**
+   * Prefix-scoped principals managed by the service (not static env clients).
+   * @returns {Array<Record<string, any>>}
+   */
+  authPrincipals() {
+    return this.managedPrincipals;
+  }
+
+  /**
+   * @returns {number}
+   */
+  managedClientCount() {
+    return this.data ? this.data.clients.length : 0;
+  }
+
+  /**
+   * @param {Record<string, any>} client
+   * @returns {string}
+   */
+  buildClientAad(client) {
+    return `client|${client.name}|${client.accessKeyId}`;
+  }
+
+  /**
+   * @param {Record<string, any>} record
+   * @param {"static"|"managed"} source
+   * @returns {Record<string, any>}
+   */
+  clientMetadata(record, source) {
+    /** @type {Record<string, any>} */
+    const metadata = {
+      Name: record.name,
+      AccessKeyId: record.accessKeyId,
+      Description: record.description || "",
+      AllowedPrefixes: [...record.allowedPrefixes],
+      Source: source,
+    };
+    if (source === "managed") {
+      metadata.CreatedDate = record.createdAt / 1000;
+      metadata.LastUpdatedDate = (record.updatedAt || record.createdAt) / 1000;
+      metadata.CreatedBy = record.createdBy || "instance-admin";
+    }
+    return metadata;
+  }
+
+  /**
+   * @param {string} name
+   * @returns {boolean}
+   */
+  clientNameExists(name) {
+    return (
+      this.staticClients.some((client) => client.name === name) ||
+      this.data.clients.some((client) => client.name === name)
+    );
+  }
+
+  /**
+   * @param {string} accessKeyId
+   * @returns {boolean}
+   */
+  accessKeyIdExists(accessKeyId) {
+    return (
+      this.reservedAccessKeyIds.has(accessKeyId) ||
+      this.data.clients.some((client) => client.accessKeyId === accessKeyId)
+    );
+  }
+
+  /**
+   * @returns {string}
+   */
+  generateAccessKeyId() {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const candidate = `AKIA${crypto.randomBytes(8).toString("hex").toUpperCase()}`;
+      if (!this.accessKeyIdExists(candidate)) {
+        return candidate;
+      }
+    }
+    throw new Error("Unable to allocate a unique client access key id.");
+  }
+
+  /**
+   * @param {unknown} raw
+   * @returns {string}
+   */
+  normalizeClientDescription(raw) {
+    if (raw === undefined) {
+      return "";
+    }
+    if (typeof raw !== "string") {
+      throw invalidParameter("Description must be a string.");
+    }
+    const description = raw.trim();
+    if (description.length > MAX_CLIENT_DESCRIPTION_LENGTH) {
+      throw invalidParameter(
+        `Description must be ${MAX_CLIENT_DESCRIPTION_LENGTH} characters or fewer.`,
+      );
+    }
+    return description;
+  }
+
+  /**
+   * @param {unknown} raw
+   * @param {string} name
+   * @returns {string[]}
+   */
+  normalizeClientPrefixes(raw, name) {
+    if (raw === undefined) {
+      return [`client/${name}/`];
+    }
+    if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_CLIENT_PREFIXES) {
+      throw invalidParameter(
+        `AllowedPrefixes must be an array of 1-${MAX_CLIENT_PREFIXES} strings.`,
+      );
+    }
+    const prefixes = [];
+    for (const value of raw) {
+      if (typeof value !== "string" || value.trim() === "") {
+        throw invalidParameter("AllowedPrefixes entries must be non-empty strings.");
+      }
+      let prefix = value.trim();
+      if (!prefix.endsWith("/")) {
+        prefix += "/";
+      }
+      if (prefix.length > 512 || !NAME_PATTERN.test(prefix)) {
+        throw invalidParameter(
+          "AllowedPrefixes entries must be 1-512 characters containing only letters, " +
+            "numbers, and /_+=.@- characters.",
+        );
+      }
+      if (!prefixes.includes(prefix)) {
+        prefixes.push(prefix);
+      }
+    }
+    return prefixes;
+  }
+
+  /**
+   * Resolve a client credential by name and/or access key id.
+   * @param {Record<string, any>} input
+   * @returns {{record: Record<string, any>, source: "static"|"managed"}}
+   */
+  resolveClient(input) {
+    if (input.Name !== undefined && typeof input.Name !== "string") {
+      throw invalidParameter("Name must be a string.");
+    }
+    if (input.AccessKeyId !== undefined && typeof input.AccessKeyId !== "string") {
+      throw invalidParameter("AccessKeyId must be a string.");
+    }
+    const name = typeof input.Name === "string" ? input.Name.trim() : "";
+    const accessKeyId = typeof input.AccessKeyId === "string" ? input.AccessKeyId.trim() : "";
+    if (!name && !accessKeyId) {
+      throw invalidParameter("Name or AccessKeyId is required.");
+    }
+    const matches = (client) =>
+      (!name || client.name === name) &&
+      (!accessKeyId || client.accessKeyId === accessKeyId);
+
+    const staticClient = this.staticClients.find(matches);
+    if (staticClient) {
+      return { record: staticClient, source: "static" };
+    }
+    const managedClient = this.data.clients.find(matches);
+    if (managedClient) {
+      return { record: managedClient, source: "managed" };
+    }
+    throw clientNotFound();
+  }
+
+  /**
+   * @returns {Record<string, any>}
+   */
+  listClientCredentials() {
+    const clients = [
+      ...this.staticClients.map((client) => this.clientMetadata(client, "static")),
+      ...this.data.clients.map((client) => this.clientMetadata(client, "managed")),
+    ];
+    clients.sort((left, right) =>
+      left.Name < right.Name ? -1 : left.Name > right.Name ? 1 : 0,
+    );
+    return { ClientCredentialList: clients };
+  }
+
+  /**
+   * @param {Record<string, any>} input
+   * @returns {Record<string, any>}
+   */
+  getClientCredential(input) {
+    const { record, source } = this.resolveClient(input);
+    let secretAccessKey;
+    if (source === "static") {
+      secretAccessKey = record.secretAccessKey;
+    } else {
+      try {
+        secretAccessKey = this.decrypt(record.secretCiphertext, this.buildClientAad(record));
+      } catch (error) {
+        throw new Error(
+          `Unable to decrypt client credential '${record.name}': ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      }
+    }
+    return {
+      ...this.clientMetadata(record, source),
+      SecretAccessKey: secretAccessKey,
+      SessionToken: source === "static" ? record.sessionToken || "" : "",
+    };
+  }
+
+  /**
+   * Create a managed, prefix-scoped client credential.
+   * @param {Record<string, any>} input
+   * @param {string} [createdBy]
+   * @returns {Record<string, any>}
+   */
+  createClientCredential(input, createdBy = "instance-admin") {
+    if (!isPlainObject(input)) {
+      throw invalidParameter("The request body must be a JSON object.");
+    }
+    if (this.data.clients.length >= MAX_MANAGED_CLIENTS) {
+      throw invalidRequest(
+        `The managed client credential limit (${MAX_MANAGED_CLIENTS}) has been reached.`,
+      );
+    }
+    if (
+      typeof input.Name !== "string" ||
+      input.Name.trim() === "" ||
+      !CLIENT_NAME_PATTERN.test(input.Name.trim())
+    ) {
+      throw invalidParameter(
+        "Name must be 1-64 characters, start with a letter or number, and contain only " +
+          "letters, numbers, dots, underscores or hyphens.",
+      );
+    }
+    const name = input.Name.trim();
+    if (this.clientNameExists(name)) {
+      throw resourceExists(`A client credential named '${name}' already exists.`);
+    }
+
+    let accessKeyId;
+    if (input.AccessKeyId === undefined) {
+      accessKeyId = this.generateAccessKeyId();
+    } else {
+      if (
+        typeof input.AccessKeyId !== "string" ||
+        !ACCESS_KEY_ID_PATTERN.test(input.AccessKeyId.trim())
+      ) {
+        throw invalidParameter(
+          "AccessKeyId must be 8-64 characters, start with a letter or number, and contain " +
+            "only letters, numbers, dots, underscores or hyphens.",
+        );
+      }
+      accessKeyId = input.AccessKeyId.trim();
+      if (this.accessKeyIdExists(accessKeyId)) {
+        throw resourceExists(
+          `A client credential with access key id '${accessKeyId}' already exists.`,
+        );
+      }
+    }
+
+    const description = this.normalizeClientDescription(input.Description);
+    const allowedPrefixes = this.normalizeClientPrefixes(input.AllowedPrefixes, name);
+    const secretAccessKey = crypto.randomBytes(32).toString("hex");
+    const now = Date.now();
+    const record = {
+      name,
+      description,
+      accessKeyId,
+      allowedPrefixes,
+      secretCiphertext: this.encrypt(
+        secretAccessKey,
+        this.buildClientAad({ name, accessKeyId }),
+      ),
+      createdAt: now,
+      updatedAt: now,
+      createdBy: String(createdBy || "instance-admin"),
+    };
+    this.data.clients.push(record);
+    this.persist();
+    this.managedPrincipals.push({
+      accessKeyId,
+      secretAccessKey,
+      sessionToken: "",
+      name,
+      admin: false,
+      allowedPrefixes: [...allowedPrefixes],
+    });
+    return {
+      ...this.clientMetadata(record, "managed"),
+      SecretAccessKey: secretAccessKey,
+      SessionToken: "",
+    };
+  }
+
+  /**
+   * Delete a managed client credential. Static env credentials are read-only.
+   * @param {Record<string, any>} input
+   * @returns {Record<string, any>}
+   */
+  deleteClientCredential(input) {
+    const { record, source } = this.resolveClient(input);
+    if (source === "static") {
+      throw invalidRequest(
+        "Client credentials from SM_CLIENTS_JSON are read-only. Remove the entry from the " +
+          "environment file and recreate the Secrets Manager container.",
+      );
+    }
+    this.data.clients = this.data.clients.filter(
+      (client) => client.accessKeyId !== record.accessKeyId,
+    );
+    this.managedPrincipals = this.managedPrincipals.filter(
+      (principal) => principal.accessKeyId !== record.accessKeyId,
+    );
+    this.persist();
+    return {
+      Name: record.name,
+      AccessKeyId: record.accessKeyId,
+      DeletionDate: Date.now() / 1000,
+    };
   }
 
   /**
@@ -1163,7 +1588,7 @@ export class SecretStore {
   }
 
   /**
-   * @returns {{ok: boolean, secrets: number, deletedSecrets: number, dataDir: string, writable: boolean, masterKeySource: string}}
+   * @returns {{ok: boolean, secrets: number, deletedSecrets: number, managedClients: number, dataDir: string, writable: boolean, masterKeySource: string}}
    */
   health() {
     let writable = false;
@@ -1178,6 +1603,7 @@ export class SecretStore {
       ok: this.ready && writable && Boolean(this.masterKey),
       secrets: secrets.filter((secret) => !secret.deletedDate).length,
       deletedSecrets: secrets.filter((secret) => Boolean(secret.deletedDate)).length,
+      managedClients: this.data ? this.data.clients.length : 0,
       dataDir: this.dataDir,
       writable,
       masterKeySource: this.masterKeySource,

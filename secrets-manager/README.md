@@ -100,8 +100,14 @@ node secrets-manager/cli.mjs ping
 | `TagResource` / `UntagResource` | Tag management. |
 | `BatchGetSecretValue` | Up to 20 ids **or** filters; per-secret errors in `Errors`. |
 | `GetRandomPassword` | `PasswordLength`, exclude flags/characters, `RequireEachIncludedType`. |
+| `CreateClientCredential` | **Local extension, admin-only.** Creates a scoped client; optional `Description`, `AllowedPrefixes` (default `client/<name>/`), `AccessKeyId`. Returns the secret once. |
+| `ListClientCredentials` | **Local extension, admin-only.** Metadata for static + managed clients; never returns secrets. |
+| `GetClientCredential` | **Local extension, admin-only.** Returns a client's access key, secret, prefixes and description. |
+| `DeleteClientCredential` | **Local extension, admin-only.** Revokes a managed client immediately; static entries are read-only. |
 
-All other AWS operations return `UnknownOperationException` (400).
+All other AWS operations return `UnknownOperationException` (400). The four
+`*ClientCredential` operations are not AWS APIs: the AWS CLI/SDK command models
+cannot address them, but `cli.mjs` and `./bin/start.sh credentials` can.
 
 ### Request/response shape
 
@@ -153,6 +159,7 @@ It checks:
 - soft delete → inaccessible → restore → accessible;
 - force delete cleanup;
 - `InvalidSignatureException` for a wrong secret key and a wrong region;
+- `ListClientCredentials` with the instance credential;
 - with `--sdk`: `@aws-sdk/client-secrets-manager` (ListSecrets + GetSecretValue)
   from a throwaway Node container on the Compose network;
 - with `--boto3`: `boto3` (ListSecrets + GetSecretValue) from a throwaway
@@ -165,7 +172,7 @@ The API reference is [API.md](API.md); the OpenAPI document is
 
 ```text
 /data/
-├── store.json   # metadata + per-version ciphertext
+├── store.json   # secret metadata + per-version ciphertext + managed client registry
 └── master.key   # 32-byte AES key, mode 0600 (generated on first boot)
 ```
 
@@ -184,6 +191,39 @@ The API reference is [API.md](API.md); the OpenAPI document is
   backups self-contained, but backups must then be handled as secrets. Set
   `SM_MASTER_KEY` to keep the key outside the volume.
 
+## Client credentials
+
+The primary `SM_ACCESS_KEY_ID` principal is the full-access instance admin.
+Scoped clients are either static (`SM_CLIENTS_JSON`, read-only at runtime) or
+managed (created through the admin-only `*ClientCredential` operations and
+stored encrypted in `store.json`).
+
+```bash
+# Inside the container (or via ./bin/start.sh credentials <env> ...)
+node cli.mjs list-client-credentials
+node cli.mjs create-client-credential acme \
+  --description "ACME billing" --prefixes client/acme/
+node cli.mjs get-client-credential acme
+node cli.mjs delete-client-credential acme
+```
+
+- Client names are 1–64 characters (`A-Z a-z 0-9 . _ -`), unique against static
+  and managed entries.
+- `AllowedPrefixes` is required at boot for static clients and defaults to
+  `client/<name>/` for managed clients. Every prefix is normalized to end in
+  `/`; a client can only touch secret names that start with one of its prefixes.
+- Managed clients are always non-admin. Only the instance credential can list,
+  read, create or delete client credentials.
+- `ListClientCredentials` returns `Name`, `AccessKeyId`, `Description`,
+  `AllowedPrefixes`, `Source` (`static`/`managed`), and for managed entries
+  `CreatedDate`, `LastUpdatedDate` and `CreatedBy`.
+- `CreateClientCredential` and `GetClientCredential` return `SecretAccessKey`;
+  `ListClientCredentials` never does. `DeleteClientCredential` removes the
+  credential from memory immediately, so its key stops working on the next
+  request.
+- Static entries cannot be deleted through the API; change `SM_CLIENTS_JSON` and
+  recreate the container.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -196,7 +236,7 @@ The API reference is [API.md](API.md); the OpenAPI document is
 | `SM_ACCESS_KEY_ID` | — | Required when auth is on |
 | `SM_SECRET_ACCESS_KEY` | — | Required when auth is on |
 | `SM_SESSION_TOKEN` | — | Optional; verified when set |
-| `SM_CLIENTS_JSON` | — | Optional JSON array of scoped client credentials: `accessKeyId`, `secretAccessKey`, optional `sessionToken`, `name`, `allowedPrefixes` |
+| `SM_CLIENTS_JSON` | — | Optional JSON array of **static** scoped clients: `accessKeyId`, `secretAccessKey`, optional `sessionToken`, `name`, `description`, `allowedPrefixes`. Runtime clients are managed through the admin API and stored in the volume. |
 | `SM_REQUIRE_AUTH` | `true` | `false` disables verification (debug only) |
 | `SM_MASTER_KEY` | — | 32-byte key, hex or base64 |
 | `SM_MAX_SECRET_BYTES` | `65536` | Value limit |
@@ -230,12 +270,14 @@ overwrite operator edits and rotations.
 
 This is a faithful local endpoint, not a complete AWS emulator:
 
-- one SigV4 principal (no IAM/resource policies or per-secret permissions);
+- no IAM/STS: one full-access instance principal plus prefix-scoped static and
+  managed client credentials (no roles, policies or per-secret permissions);
 - no KMS integration, customer managed keys or automatic rotation lambdas;
 - resource policies and replication return unsupported errors;
 - `KmsKeyId` is accepted and stored, but encryption uses the local master key;
 - secret values are capped at 64 KiB and the request body at 1 MiB;
-- SigV4 header auth only (no presigned URLs); the primary credential is full-access and `SM_CLIENTS_JSON` entries are prefix-scoped;
+- SigV4 header auth only (no presigned URLs); the primary credential is full-access, while static and managed client credentials are prefix-scoped and non-admin;
+- `*ClientCredential` operations are local extensions, not AWS APIs;
 - The service uses HTTP inside the private Compose network. The production
   host nginx terminates TLS on port 443 and proxies to loopback 18001; the
   loopback port is not public.
@@ -248,8 +290,8 @@ API.md                full API reference (protocol + operations)
 openapi.yaml          OpenAPI 3.1 specification
 examples/             AWS SDK v3 + boto3 client examples
 lib/sigv4.mjs         canonicalisation, signing and verification
-lib/store.mjs         AES-256-GCM store, versions, tags, pagination
-lib/operations.mjs    operation dispatch table
+lib/store.mjs         AES-256-GCM store, versions, tags, pagination, client registry
+lib/operations.mjs    operation dispatch table (incl. admin client-credential ops)
 lib/errors.mjs        AWS error types and status codes
 lib/logger.mjs        structured JSON logging
 lib/util.mjs          hashing, encoding, small helpers

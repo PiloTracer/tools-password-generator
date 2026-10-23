@@ -202,7 +202,8 @@ Without it, `APP_ENV` from your shell is used, then `dev`.
 | `restore <path>` | Verified restore of a bundle or staging directory |
 | `backups list\|verify\|prune` | Manage backup artifacts |
 | `cleanup <scope>` | `containers`, `volumes`, `images`, `backups`, `all`, `dangling` |
-| `secrets <sub>` | `list`, `get`, `put`, `create`, `describe`, `delete`, `seed`, `test`, `verify`, `endpoint`, `random`, `raw` |
+| `secrets <sub>` | `list`, `get`, `put`, `create`, `describe`, `delete`, `seed`, `test`, `verify`, `endpoint`, `random`, `raw`, `credentials` |
+| `credentials <sub>` | `list`, `show <name>`, `create <name> [--description TEXT] [--prefixes P1,P2]`, `delete <name>` |
 | `shell [service]` | Shell in `app` (default) or `secrets-manager` |
 | `exec <cmd...>` | Run a command in the app container |
 | `test-cli` | Exercise `password_generator.py` (host `python3`, else container) |
@@ -230,6 +231,10 @@ Examples:
 ./bin/start.sh check-env
 ./bin/start.sh secrets dev get password-generator/dev/app-config --json
 ./bin/start.sh secrets dev put password-generator/dev/app-config --file config.json
+./bin/start.sh credentials dev list
+./bin/start.sh credentials dev create acme --description "ACME billing"
+./bin/start.sh credentials dev show acme --json
+./bin/start.sh credentials dev delete acme --yes
 ```
 
 Exit codes: `0` success, `1` failure, `2` usage error.
@@ -252,6 +257,9 @@ Exit codes: `0` success, `1` failure, `2` usage error.
 | `--volume NAME` | `restore` | Target volume for a single-volume archive |
 | `--strict` | `health` | Treat degraded readiness as a failure |
 | `--sdk`, `--boto3` | `secrets verify` | Also run the AWS SDK v3 / boto3 client checks |
+| `--description TEXT` | `credentials create` | Optional description (static `SM_CLIENTS_JSON` entries accept one too) |
+| `--prefixes P1,P2` | `credentials create` | Comma-separated allowed prefixes; default `client/<name>/` |
+| `--access-key-id ID` | `credentials create` | Pin the access key id; default is a generated `AKIA…` value |
 
 ---
 
@@ -365,10 +373,16 @@ The protocol details:
 | `TagResource` / `UntagResource` | Tag management |
 | `BatchGetSecretValue` | Up to 20 ids, per-secret errors |
 | `GetRandomPassword` | Character classes, exclusions, length |
+| `CreateClientCredential` | **Extension, admin-only:** scoped client + optional `Description` |
+| `ListClientCredentials` | **Extension, admin-only:** static + managed metadata (never secrets) |
+| `GetClientCredential` | **Extension, admin-only:** read a client's secret |
+| `DeleteClientCredential` | **Extension, admin-only:** revoke a managed client |
 
 Unsupported AWS features (KMS rotation lambdas, resource policies, replication,
 managed rotation) return protocol-compatible errors or are stored as metadata.
-Secret values are limited to 64 KiB, like AWS.
+Secret values are limited to 64 KiB, like AWS. The four `*ClientCredential`
+operations are local extensions, not AWS APIs: the AWS CLI cannot call them, but
+`secrets-manager/cli.mjs` and `./bin/start.sh credentials` can.
 
 ### AWS CLI examples
 
@@ -424,6 +438,48 @@ const result = await client.send(new GetSecretValueCommand({
   SecretId: "password-generator/dev/app-config",
 }));
 ```
+
+### Client credentials
+
+The primary `SM_ACCESS_KEY_ID` / `SM_SECRET_ACCESS_KEY` pair is the full-access
+instance credential. Scoped client credentials come from two places:
+
+| Source | Provisioned by | Lifecycle |
+|---|---|---|
+| `static` | `SM_CLIENTS_JSON` in `.env.<env>` | read-only through the API; edit the env file and recreate the container |
+| `managed` | `CreateClientCredential` / `./bin/start.sh credentials … create` | stored encrypted in the data volume; survives restart, backup and restore |
+
+Managed credentials are always prefix-scoped and non-admin. They accept an
+optional `Description` and a list of `AllowedPrefixes` (default
+`client/<name>/`). `CreateClientCredential` returns the generated secret once;
+`GetClientCredential` can retrieve it again for an administrator;
+`ListClientCredentials` returns metadata only and never secret material. Static
+`SM_CLIENTS_JSON` entries may also carry an optional `description`.
+
+```bash
+./bin/start.sh credentials dev list
+./bin/start.sh credentials dev create acme --description "ACME billing" --prefixes client/acme/
+./bin/start.sh credentials dev show acme
+./bin/start.sh credentials dev delete acme --yes
+```
+
+The printed environment variables use the client name as prefix, so `acb` keeps
+the existing `ACB_SECRETS_AWS_*` names and `acme` gets `ACME_SECRETS_AWS_*`.
+
+**Why only predefined names worked before:** the service had no credential
+registry. Scoped clients were validated from the in-memory `SM_CLIENTS_JSON`
+array parsed at boot, and `./bin/start.sh credentials` only read that env file,
+so any name other than a configured one was rejected. Adding a client meant
+editing `.env.<env>` and recreating the container. The managed registry removes
+that limitation while keeping credentials out of client reach: the four
+`*ClientCredential` operations are admin-only, and a scoped client receives
+`AccessDeniedException` if it tries to list, read, create or delete client
+credentials.
+
+> Managed credentials are stored in `store.json` with AES-256-GCM; the AAD binds
+> each ciphertext to the client name and access key id. They are covered by the
+> normal volume backup/restore flow and protected by the same master key. They
+> are never written in plaintext, and listing never returns the secret.
 
 ### How the app uses it
 
@@ -489,7 +545,7 @@ overwrite existing values (for example after changing the word list):
 | `SM_ACCESS_KEY_ID` | — | SigV4 access key (required) |
 | `SM_SECRET_ACCESS_KEY` | — | SigV4 secret (required) |
 | `SM_SESSION_TOKEN` | — | Optional session token |
-| `SM_CLIENTS_JSON` | — | Optional scoped client credentials (JSON array); each client is limited to `allowedPrefixes` |
+| `SM_CLIENTS_JSON` | — | Static bootstrap scoped clients (JSON array): `name`, `accessKeyId`, `secretAccessKey`, optional `description`, `allowedPrefixes`; managed clients are created at runtime |
 | `SM_REQUIRE_AUTH` | `true` | Set `false` only for isolated debugging |
 | `SM_MASTER_KEY` | — | 32-byte hex/base64 key; else `master.key` |
 | `SM_MAX_SECRET_BYTES` | `65536` | Per-value limit |

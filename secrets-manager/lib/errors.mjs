@@ -37,10 +37,16 @@ export function resourceNotFound() {
   );
 }
 
-export function resourceExists() {
+export function resourceExists(
+  message = "The operation failed because the secret already exists.",
+) {
+  return new AwsError("ResourceExistsException", message);
+}
+
+export function clientNotFound() {
   return new AwsError(
-    "ResourceExistsException",
-    "The operation failed because the secret already exists.",
+    "ResourceNotFoundException",
+    "Secrets Manager can't find the specified client credential.",
   );
 }
 

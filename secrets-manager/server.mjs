@@ -13,8 +13,9 @@ import { dispatch, SUPPORTED_OPERATIONS } from "./lib/operations.mjs";
 import { signRequest, verifyRequest } from "./lib/sigv4.mjs";
 import { SecretStore } from "./lib/store.mjs";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_CLIENT_DESCRIPTION_LENGTH = 512;
 
 /**
  * Parse the optional per-client SigV4 credentials.
@@ -42,6 +43,7 @@ function parseClientCredentials(raw, primaryAccessKeyId) {
   }
 
   const seen = new Set(primaryAccessKeyId ? [primaryAccessKeyId] : []);
+  const names = new Set();
   return parsed.map((entry, index) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error(`SM_CLIENTS_JSON[${index}] must be an object.`);
@@ -60,6 +62,19 @@ function parseClientCredentials(raw, primaryAccessKeyId) {
 
     const sessionToken = String(entry.sessionToken || "").trim();
     const name = String(entry.name || accessKeyId).trim();
+    if (!name) {
+      throw new Error(`SM_CLIENTS_JSON[${index}] has an empty name.`);
+    }
+    if (names.has(name)) {
+      throw new Error(`SM_CLIENTS_JSON contains a duplicate client name: ${name}`);
+    }
+    names.add(name);
+    const description = String(entry.description || "").trim();
+    if (description.length > MAX_CLIENT_DESCRIPTION_LENGTH) {
+      throw new Error(
+        `SM_CLIENTS_JSON[${index}] description must be ${MAX_CLIENT_DESCRIPTION_LENGTH} characters or fewer.`,
+      );
+    }
     const rawPrefixes = entry.allowedPrefixes;
     if (!Array.isArray(rawPrefixes) || rawPrefixes.length === 0) {
       throw new Error(
@@ -85,6 +100,7 @@ function parseClientCredentials(raw, primaryAccessKeyId) {
       secretAccessKey,
       sessionToken,
       name,
+      description,
       admin: false,
       allowedPrefixes,
     };
@@ -345,6 +361,8 @@ function main() {
       maxSecretBytes: config.maxSecretBytes,
       recoveryWindowDays: config.recoveryWindowDays,
       logger,
+      staticClients: config.clients,
+      reservedAccessKeyIds: config.accessKeyId ? [config.accessKeyId] : [],
     }).init();
   } catch (error) {
     logger.error("unable to initialise the secret store", {
@@ -436,7 +454,7 @@ function main() {
           headers: req.headers,
           body,
           config: {
-            credentials: config.principals,
+            credentials: [...config.principals, ...store.authPrincipals()],
             region: config.region,
             service: config.service,
             maxClockSkewMs: config.maxClockSkewMs,
@@ -522,7 +540,7 @@ function main() {
       region: config.region,
       accountId: config.accountId,
       authRequired: config.requireAuth,
-      clientCredentials: config.clients.length,
+      clientCredentials: config.clients.length + store.managedClientCount(),
       dataDir: config.dataDir,
       secrets: store.health().secrets,
     });

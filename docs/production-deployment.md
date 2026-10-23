@@ -179,37 +179,60 @@ public listener.
 ### Client credentials
 
 The primary `SECRETS_MANAGER_ACCESS_KEY_ID` remains the full-access instance
-credential used by the password generator. Additional clients are configured in
-`SM_CLIENTS_JSON` as a JSON array of scoped SigV4 credentials:
+credential used by the password generator. There are two ways to issue scoped
+client credentials:
 
-```dotenv
-SM_CLIENTS_JSON='[{"name":"acb","accessKeyId":"acb-prd-access","secretAccessKey":"<64-hex>","sessionToken":"","allowedPrefixes":["client/acb/"]}]'
-```
+1. **Static bootstrap (`SM_CLIENTS_JSON`).** Entries are read at boot and are
+   read-only through the API — edit the env file and recreate the container to
+   change them. This is the break-glass/initial-onboarding path:
+
+   ```dotenv
+   SM_CLIENTS_JSON='[{"name":"acb","accessKeyId":"acb-prd-access","secretAccessKey":"<64-hex>","sessionToken":"","description":"ACB production client","allowedPrefixes":["client/acb/"]}]'
+   ```
+
+2. **Managed by the server (recommended for new clients).** Create credentials
+   through the admin-only `CreateClientCredential` operation, or with the
+   control script. They are stored encrypted in the data volume, survive
+   restarts, and are included in backups:
+
+   ```bash
+   ./bin/start.sh credentials prd list
+   ./bin/start.sh credentials prd create acme \
+     --description "ACME billing integration" \
+     --prefixes client/acme/
+   ./bin/start.sh credentials prd show acme
+   ./bin/start.sh credentials prd delete acme --yes
+   ```
+
+   `create` prints the generated secret (and the client's `*_SECRETS_AWS_*`
+   variables) on stdout; `list` prints metadata only. `--description` is
+   optional and may be up to 512 characters. If `--prefixes` is omitted, the
+   prefix defaults to `client/<name>/`. `--access-key-id` pins an id; otherwise
+   a random `AKIA…` id is generated.
 
 Each client can only list, read, write, tag, delete or restore secrets whose
 names start with one of its `allowedPrefixes`. The password generator's
-`password-generator/...` secrets are not visible to the client. Generate the
-client secret with `openssl rand -hex 32`; never commit it. After changing
-`SM_CLIENTS_JSON`, recreate the Secrets Manager container:
+`password-generator/...` secrets are not visible to the client. A managed
+client is always non-admin: it receives `AccessDeniedException` for the four
+`*ClientCredential` operations, so it cannot mint or inspect credentials.
+
+Static changes still require a recreate:
 
 ```bash
 ./bin/start.sh recreate prd
 ```
 
-Use a distinct access key and secret for dev and prd. The ACB client also needs
-the endpoint (`https://secrets.agiolab.com` in prd) and `us-east-1`; its session
-token is empty because this service does not issue temporary STS credentials.
+Use a distinct access key and secret for dev and prd. Clients need the endpoint
+(`https://secrets.agiolab.com` in prd) and `us-east-1`; session tokens are empty
+because this service does not issue temporary STS credentials.
 
-On the server, print the selected client credential from the current `.env`:
-
-```bash
-./bin/start.sh credentials prd acb
-# or, from the menu: Secrets Manager -> Show client credentials
-```
-
-The command reads `SM_CLIENTS_JSON`, does not need the container running, and
-prints the three ACB variables plus the endpoint and region. Treat its output as
-a secret and deliver it out of band.
+`./bin/start.sh credentials prd …` uses the running Secrets Manager for managed
+clients. If the container is stopped, `list` and `show` fall back to the static
+`SM_CLIENTS_JSON` entries and clearly say so. Treat every `show`/`create` output
+as a secret and deliver it out of band. To revoke a managed client, delete it
+(the key stops working immediately); to rotate, delete and create a replacement.
+Because the registry lives in the encrypted data volume, take a volume backup
+before bulk changes: `./bin/start.sh backup prd`.
 
 ---
 
