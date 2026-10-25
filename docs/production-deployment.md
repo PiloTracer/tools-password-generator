@@ -373,13 +373,143 @@ through host nginx.
 
 ## 9. Upgrades
 
+Named volumes persist. Host nginx is **not** restarted by `start.sh`; its config
+and certificates are managed separately — that is why step 4 below is manual.
+
+### 9.1 Pre-flight (do not skip)
+
 ```bash
-./bin/start.sh backup prd
-./bin/start.sh rebuild prd     # no-cache build + recreate + health checks
+cd /path/to/tools-password-generator
+git pull --ff-only
+git log --oneline -2            # confirm the release you intend to ship
+git status -sb                  # must be clean
+python3 --version               # required by bin/ensure-app-credentials.py
 ```
 
-Named volumes persist. Host nginx is not restarted by `start.sh`; its config
-and certificates are managed separately.
+`bin/start.sh` enforces `.env.example` ↔ `.env.dev` ↔ `.env.prd` parity on
+**every** command. If `start.sh` aborts with `Environment parity check failed`,
+add the missing keys to `.env.prd` before anything else. This release adds six:
+
+```bash
+APP_MEM_LIMIT=512m
+APP_CPUS=1.0
+APP_PIDS_LIMIT=256
+SECRETS_MANAGER_MEM_LIMIT=256m
+SECRETS_MANAGER_CPUS=0.5
+SECRETS_MANAGER_PIDS_LIMIT=128
+```
+
+```bash
+chmod 600 .env.prd
+./bin/start.sh check-env prd
+./bin/start.sh doctor prd
+```
+
+Only one environment runs per host (dev and prd share ports). Stop dev first:
+`./bin/start.sh down dev`.
+
+### 9.2 Backup and baseline
+
+```bash
+./bin/start.sh backup prd
+./bin/start.sh backups list prd
+curl -s https://secrets.agiolab.com/healthz
+docker inspect --format '{{.Config.Image}} {{.Image}}' password_app_prd password_secrets_prd
+sudo cp /etc/nginx/conf.d/agiolab.conf /root/agiolab.conf.bak.$(date +%F) 2>/dev/null || true
+```
+
+The bundle contains the store's `master.key`; it is `0600`, but still treat a
+copy as a secret.
+
+### 9.3 Deploy
+
+```bash
+./bin/start.sh rebuild prd
+```
+
+`rebuild` snapshots the images it is about to replace as
+`<repo>:rollback-<UTC>` **before** building — that snapshot is your rollback
+point. It then recreates, runs health checks and seeds any missing secrets.
+
+### 9.4 Install the edge config (manual)
+
+This release changes the edge: `X-Forwarded-For` is overwritten (not appended),
+per-IP limits are added, and the four `*ClientCredential` targets are denied.
+
+```bash
+sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### 9.5 Verify
+
+```bash
+./bin/start.sh health prd --strict
+./bin/start.sh smoke prd
+./bin/verify-secrets-manager.sh --env prd
+```
+
+The edge deny rule must be live for all four operations (expect `403` four
+times — a `400` here means the service, not nginx, answered):
+
+```bash
+for op in CreateClientCredential GetClientCredential DeleteClientCredential ListClientCredentials; do
+  printf '%-26s ' "$op"
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST https://secrets.agiolab.com/ \
+    -H "X-Amz-Target: secretsmanager.$op" \
+    -H 'Content-Type: application/x-amz-json-1.1' -d '{}'
+done
+```
+
+Data plane and app still answer:
+
+```bash
+curl -s https://secrets.agiolab.com/readyz          # {"status":"ready","ok":true,"version":"1.1.0"}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://agiolab.com/api/generate \
+  -H 'Content-Type: application/json' --data '{"mode":"words","wordCount":4}'
+curl -s https://agiolab.com/api/health | grep -qE '/app/|/code/|"expected"|"actual"' \
+  && echo 'LEAK' || echo 'health payload clean'
+```
+
+Then confirm both live clients: generate in the browser, and one
+`GetSecretValue` from the integrating client.
+
+### 9.6 Apply the new throttle value (optional)
+
+The seeded policy for a new environment is 30 req/min; an existing secret keeps
+its old value until rewritten.
+
+```bash
+./bin/start.sh secrets prd seed --force     # rewrites app-config from seed defaults
+```
+
+`--force` also resets any hand-tuned limits in that secret. If you customised
+them, read the secret, edit `requestsPerMinute`, and write it back instead of
+forcing.
+
+### 9.7 Record the release
+
+```bash
+docker inspect --format '{{.Config.Image}} {{.Image}}' password_app_prd password_secrets_prd
+curl -s https://secrets.agiolab.com/healthz
+```
+
+### 9.8 Rollback
+
+```bash
+./bin/start.sh rollback --list prd
+./bin/start.sh rollback <stamp> prd
+```
+
+Rollback restores **images only** — it does not revert the nginx config and does
+not touch data. If the edge is the problem, restore the saved config:
+
+```bash
+sudo cp /root/agiolab.conf.bak.<date> /etc/nginx/conf.d/agiolab.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Use `./bin/start.sh restore <bundle>` only for data loss, not for a bad deploy.
 
 ---
 
