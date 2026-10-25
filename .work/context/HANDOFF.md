@@ -6,11 +6,13 @@
 
 **Updated:** 2026-10-25
 
-**Closed:** 2026-10-25 — committed and pushed on `main` (see §Draft commit for the message used)
+**Closed:** 2026-10-25 — committed and pushed on `main` (`2afb913`); working tree clean
 
 **Repository state:** Brownfield, in production. Live clients run commit `269b9c6`; the working tree holds the hardening diff plus this session's remediation. Contract suite 40/40 green on both revisions. Edge config functionally verified against stub upstreams (not only `nginx -t`). App gate green (typecheck + lint + **22 unit tests**). Smoke **13/13** including abuse-refusal guards. Foundation docs 01–04, ADRs 001–005, threat model, personas, two SPECs and a rollback path exist. **`Foundation-complete: yes`** · **`Plan-master-ready: yes` (2026-10-25, waivers W1–W4)**. Master plan **Approved** by the owner 2026-10-25. Public health/readiness endpoints sanitised (`HEALTH_VERBOSE` for detail) and the health probe now exercises a real generation. **Next: M1-T2 deploy window.**
 
-**Recommended pick-up file:** `.work/plans/NEXT.md`
+**Recommended pick-up file:** `.work/plans/NEXT.md` (next action: **M1-T2 — gated prd deploy**)
+
+**First 3 commands next session:** `git pull --ff-only` · `./bin/start.sh status dev` · `./bin/start.sh smoke dev`
 
 **Lost or new?** Read `.ai/START_HERE.md` (from repo root).
 

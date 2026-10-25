@@ -1,42 +1,7 @@
 {
   "ref": "",
   "updated": "2026-10-25",
-  "goal": "S1-S6 reliability/hardening program: audit, pin deployed contract with tests, synthesize plan from code, remediate, harden, add on-box CLI credential management, and add a rollback path. Scope includes the pre-existing 16-file hardening diff that predates this session (it is the deployable state under review) and the owner-approved protected-file changes (nginx edge, compose limits, env declarations, rollback).",
-  "allowed_paths": [
-    ".work",
-    ".work.biz",
-    ".work.cto",
-    ".work.flutter",
-    ".work.mlt",
-    ".work.soc",
-    ".work.ui",
-    ".cursorrules",
-    "opencode.json",
-    "password_generator.py",
-    "secrets-manager",
-    "password",
-    "bin",
-    "docs",
-    "deploy",
-    "README.md",
-    "DOCS_TECH_STACK.md",
-    "docker-compose.dev.yml",
-    "docker-compose.prd.yml",
-    "Dockerfile.password.dev",
-    "Dockerfile.password.prd",
-    "backups",
-    ".env.example",
-    ".env.dev",
-    ".env.prd"
-  ],
-  "allowed_patterns": [
-    "secrets-manager/**/*.mjs",
-    "secrets-manager/**/*.md",
-    "secrets-manager/**/*.yaml",
-    "password/**/*.ts",
-    "password/**/*.tsx",
-    "password/**/*.mjs",
-    "password/**/*.json",
-    ".work/**/*.md"
-  ]
+  "goal": "No active change - declare scope before editing (see .cursorrules \u00a7 Change safety)",
+  "allowed_paths": [],
+  "allowed_patterns": []
 }
