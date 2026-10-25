@@ -10,7 +10,9 @@
 #    • soft delete -> access denied -> restore -> access,
 #    • rejected requests for a wrong secret key and a wrong region,
 #    • the bundled SigV4 client when the AWS CLI is unavailable,
-#    • the admin-only client-credential list extension,
+#    • the admin-only client-credential operations on the loopback admin
+#      listener and their rejection on the public listener,
+#    • the application's scoped read-only credential (when provisioned),
 #    • optionally a real AWS SDK v3 client (--sdk),
 #    • optionally a real Python boto3 client (--boto3).
 #
@@ -43,6 +45,8 @@ SECRET_NAME=""
 SECRET_CREATED=false
 PROJECT=""
 APP_CONFIG_SECRET_ID=""
+TEMP_APP_WRITE=""
+TEMP_OUTSIDE=""
 
 usage() {
   cat <<'EOF'
@@ -136,7 +140,27 @@ compose_sm() {
 }
 
 sm_cli() {
-  compose_sm exec -T secrets-manager node cli.mjs "$@"
+  local endpoint="http://127.0.0.1:8080"
+  if compose_sm exec -T secrets-manager node -e "fetch('http://127.0.0.1:8081/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" >/dev/null 2>&1; then
+    endpoint="http://127.0.0.1:8081"
+  fi
+  compose_sm exec -T -e "SM_ENDPOINT=$endpoint" secrets-manager node cli.mjs "$@"
+}
+
+# Run the bundled client inside the Secrets Manager container while overriding
+# the container's instance credential with a specific principal.  Empty SM_*
+# values make client.mjs fall back to the AWS_* values.
+run_as_client() {
+  local endpoint="$1" access_key="$2" secret_key="$3"
+  shift 3
+  compose_sm exec -T \
+    -e SM_ACCESS_KEY_ID= \
+    -e SM_SECRET_ACCESS_KEY= \
+    -e SM_SESSION_TOKEN= \
+    -e "AWS_ACCESS_KEY_ID=$access_key" \
+    -e "AWS_SECRET_ACCESS_KEY=$secret_key" \
+    -e "SM_ENDPOINT=$endpoint" \
+    secrets-manager node cli.mjs "$@"
 }
 
 cleanup() {
@@ -148,6 +172,12 @@ cleanup() {
     fi
     SECRET_CREATED=false
   fi
+  local name
+  for name in "$TEMP_APP_WRITE" "$TEMP_OUTSIDE"; do
+    if [ -n "$name" ]; then
+      sm_cli delete-secret "$name" --force >/dev/null 2>&1 || true
+    fi
+  done
 }
 trap cleanup EXIT INT TERM
 
@@ -379,10 +409,102 @@ else
   fi
 fi
 
-if sm_cli list-client-credentials 2>/dev/null | grep -q '"ClientCredentialList"'; then
-  pass "ListClientCredentials (admin-only extension)"
+if compose_sm exec -T secrets-manager node -e "fetch('http://127.0.0.1:8081/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" >/dev/null 2>&1; then
+  pass "Admin listener is available (127.0.0.1:8081)"
 else
-  fail "ListClientCredentials (admin-only extension)"
+  fail "Admin listener is unavailable (127.0.0.1:8081)"
+fi
+
+if sm_cli list-client-credentials 2>/dev/null | grep -q '"ClientCredentialList"'; then
+  pass "ListClientCredentials (admin listener)"
+else
+  fail "ListClientCredentials (admin listener)"
+fi
+
+# All four admin operations must be rejected on the public listener.
+for admin_op in CreateClientCredential DeleteClientCredential GetClientCredential ListClientCredentials; do
+  public_admin_output="$(run_as_client http://127.0.0.1:8080 "$SECRETS_MANAGER_ACCESS_KEY_ID" "$SECRETS_MANAGER_SECRET_ACCESS_KEY" raw "$admin_op" '{}' 2>&1 || true)"
+  if printf '%s' "$public_admin_output" | grep -q 'AccessDeniedException'; then
+    pass "Public listener rejects $admin_op (AccessDeniedException)"
+  else
+    fail "Public listener did not reject $admin_op"
+    note "  output: $public_admin_output"
+  fi
+done
+
+# The app must use a scoped, read-only credential rather than the instance admin.
+APP_ACCESS_KEY=""
+APP_SECRET_KEY=""
+APP_CONTAINER="$(compose_sm ps -q app 2>/dev/null | head -n 1)"
+if [ -n "$APP_CONTAINER" ]; then
+  app_env="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$APP_CONTAINER" 2>/dev/null || true)"
+  APP_ACCESS_KEY="$(printf '%s\n' "$app_env" | sed -n 's/^AWS_ACCESS_KEY_ID=//p' | head -n 1)"
+  APP_SECRET_KEY="$(printf '%s\n' "$app_env" | sed -n 's/^AWS_SECRET_ACCESS_KEY=//p' | head -n 1)"
+  if [ -n "$APP_ACCESS_KEY" ] && [ "$APP_ACCESS_KEY" = "$SECRETS_MANAGER_ACCESS_KEY_ID" ]; then
+    fail "The app container still uses the instance admin credential"
+    APP_ACCESS_KEY=""
+    APP_SECRET_KEY=""
+  elif [ -n "$APP_ACCESS_KEY" ] && [ -n "$APP_SECRET_KEY" ]; then
+    pass "The app container uses a scoped credential (not the instance admin)"
+  else
+    skip "The app container credential could not be read"
+  fi
+else
+  skip "The app container is not running"
+fi
+
+if [ -n "$APP_ACCESS_KEY" ] && [ -n "$APP_SECRET_KEY" ]; then
+  app_read_output="$(run_as_client http://127.0.0.1:8080 "$APP_ACCESS_KEY" "$APP_SECRET_KEY" get-secret-value "$APP_CONFIG_SECRET_ID" --json 2>&1 || true)"
+  if printf '%s' "$app_read_output" | grep -q '"SecretString"'; then
+    pass "App credential can read its policy secret"
+  else
+    fail "App credential could not read $APP_CONFIG_SECRET_ID"
+  fi
+
+  TEMP_APP_WRITE="password-generator/$ENV_NAME/verify-app-$ENV_NAME-$$"
+  app_write_output="$(printf 'verify' | run_as_client http://127.0.0.1:8080 "$APP_ACCESS_KEY" "$APP_SECRET_KEY" create-secret "$TEMP_APP_WRITE" --stdin 2>&1 || true)"
+  if printf '%s' "$app_write_output" | grep -q 'AccessDeniedException'; then
+    pass "App credential is read-only (CreateSecret denied)"
+  else
+    fail "App credential was able to create a secret"
+    sm_cli delete-secret "$TEMP_APP_WRITE" --force >/dev/null 2>&1 || true
+  fi
+
+  app_admin_output="$(run_as_client http://127.0.0.1:8081 "$APP_ACCESS_KEY" "$APP_SECRET_KEY" list-client-credentials 2>&1 || true)"
+  if printf '%s' "$app_admin_output" | grep -q 'AccessDeniedException'; then
+    pass "App credential cannot manage clients on the admin listener"
+  else
+    fail "App credential managed clients on the admin listener"
+  fi
+
+  # Prefix isolation: create a secret outside the app prefix as admin, then try
+  # to read it with the app credential.
+  TEMP_OUTSIDE="client/verify-$ENV_NAME-$$/db-password"
+  if printf 'outside' | sm_cli create-secret "$TEMP_OUTSIDE" --stdin >/dev/null 2>&1; then
+    app_outside_output="$(run_as_client http://127.0.0.1:8080 "$APP_ACCESS_KEY" "$APP_SECRET_KEY" get-secret-value "$TEMP_OUTSIDE" 2>&1 || true)"
+    if printf '%s' "$app_outside_output" | grep -q 'AccessDeniedException'; then
+      pass "App credential cannot read another client's prefix"
+    else
+      fail "App credential read a secret outside its prefix"
+    fi
+    sm_cli delete-secret "$TEMP_OUTSIDE" --force >/dev/null 2>&1 || true
+  else
+    skip "Prefix isolation check (could not create a temporary secret)"
+  fi
+else
+  skip "App credential checks (app credential not available)"
+fi
+
+# The admin listener is container-loopback only; another container must not
+# be able to reach it.
+if [ -n "$APP_CONTAINER" ]; then
+  if compose_sm exec -T app node -e "fetch('http://secrets-manager:8081/healthz',{signal:AbortSignal.timeout(2000)}).then(()=>process.exit(1)).catch(()=>process.exit(0))" >/dev/null 2>&1; then
+    pass "Admin listener is not reachable from the app container"
+  else
+    fail "Admin listener is reachable from the app container"
+  fi
+else
+  skip "Admin listener isolation check (app container not running)"
 fi
 
 if [ "$USE_SDK" = true ]; then

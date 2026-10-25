@@ -216,6 +216,24 @@ names start with one of its `allowedPrefixes`. The password generator's
 client is always non-admin: it receives `AccessDeniedException` for the four
 `*ClientCredential` operations, so it cannot mint or inspect credentials.
 
+Credential management is also **server-local**: the four `*ClientCredential`
+operations are served only on the Secrets Manager container's loopback admin
+listener (`127.0.0.1:8081` inside the container) and are rejected by the public
+listener and the public nginx edge. `./bin/start.sh credentials …` uses that
+listener automatically. The application itself uses an auto-generated, scoped,
+read-only credential (managed by `./bin/start.sh` in `.run/`); it cannot mint
+or modify credentials. To deploy this change without breaking existing clients:
+
+```bash
+# 1. Block credential management on the public edge (no client impact):
+sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
+sudo nginx -t && sudo systemctl reload nginx
+# 2. Rebuild and recreate the stack (brief restart):
+./bin/start.sh up prd
+# 3. Verify:
+./bin/start.sh secrets prd verify
+```
+
 Static changes still require a recreate:
 
 ```bash

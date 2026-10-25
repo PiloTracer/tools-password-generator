@@ -1,3 +1,4 @@
+import { coerceRequestsPerMinute, DEFAULT_REQUESTS_PER_MINUTE } from "./rate-limit";
 import { getSecretJson, secretsManagerEnabled } from "./secrets-manager";
 
 export type WordlistEnforcement = "off" | "warn" | "enforce";
@@ -41,7 +42,7 @@ export const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
     mixedCaseCountMax: 128,
     wordCountMin: 2,
     wordCountMax: 16,
-    requestsPerMinute: 120,
+    requestsPerMinute: DEFAULT_REQUESTS_PER_MINUTE,
   },
   features: {
     characters: true,
@@ -110,11 +111,9 @@ function parseRuntimeConfig(raw: unknown, base: RuntimeConfig): RuntimeConfig {
     ),
     wordCountMin: clampInteger(limitsRaw.wordCountMin, base.limits.wordCountMin, 1, 64),
     wordCountMax: clampInteger(limitsRaw.wordCountMax, base.limits.wordCountMax, 1, 64),
-    requestsPerMinute: clampInteger(
+    requestsPerMinute: coerceRequestsPerMinute(
       limitsRaw.requestsPerMinute,
       base.limits.requestsPerMinute,
-      0,
-      6000,
     ),
   };
   if (limits.lengthMax < limits.lengthMin) {

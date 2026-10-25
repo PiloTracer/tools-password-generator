@@ -40,6 +40,14 @@ proxies to `127.0.0.1:18001`. The loopback port 18001 is not public. SigV4
 protects requests from tampering/replay and TLS protects them in transit. The
 edge preserves the `Host` header and path, both signed by SigV4.
 
+**Admin listener.** The service also listens on `SM_ADMIN_HOST:SM_ADMIN_PORT`
+(default `127.0.0.1:8081`) inside the container. The four `*ClientCredential`
+operations are served **only** there; the public listener returns
+`AccessDeniedException` for them, and the production nginx edge returns `403`.
+The admin listener is not published through Compose. Use
+`./bin/start.sh credentials <env> ...`, or a direct `cli.mjs` call inside the
+container with `SM_ENDPOINT=http://127.0.0.1:8081`.
+
 **Health endpoints** (no SigV4, no secret data):
 
 | Request | Response |
@@ -101,11 +109,13 @@ export AWS_ENDPOINT_URL_SECRETSMANAGER=http://127.0.0.1:18001
 > Additional credentials are limited to their `allowedPrefixes`: list/batch
 > operations are filtered, and operations on other secret names return
 > `AccessDeniedException`. Scoped clients come from `SM_CLIENTS_JSON` (static,
-> read-only at runtime) or are created through the admin-only
+> fixed at boot, optional `readOnly`) or are created through the admin-only
 > `*ClientCredential` operations (managed, encrypted in the data volume). This
 > is not IAM/STS; there are no policies, roles, or temporary credentials.
 > Only the primary credential can manage client credentials; a scoped client
 > receives `AccessDeniedException` for every `*ClientCredential` operation.
+> Those operations are served only on the container-loopback admin listener;
+> the public listener and the nginx edge reject them for every principal.
 
 Only header-based SigV4 is supported; presigned query URLs are rejected.
 
@@ -494,8 +504,9 @@ at least one character from every included class is guaranteed.
 
 ### 5.14 ListClientCredentials
 
-**Local extension, admin-only.** Lists static (`SM_CLIENTS_JSON`) and managed
-client credentials. Request: `{}`. The response never contains secret material.
+**Local extension, admin-only, loopback admin listener only.** Lists static
+(`SM_CLIENTS_JSON`) and managed client credentials. Request: `{}`. The response
+never contains secret material.
 
 ```json
 {
@@ -505,6 +516,7 @@ client credentials. Request: `{}`. The response never contains secret material.
       "AccessKeyId": "acb-prd-access",
       "Description": "ACB production client",
       "AllowedPrefixes": ["client/acb/"],
+      "ReadOnly": false,
       "Source": "static"
     },
     {
@@ -512,6 +524,7 @@ client credentials. Request: `{}`. The response never contains secret material.
       "AccessKeyId": "AKIA0123456789ABCDEF",
       "Description": "ACME billing integration",
       "AllowedPrefixes": ["client/acme/"],
+      "ReadOnly": false,
       "Source": "managed",
       "CreatedDate": 1730000000,
       "LastUpdatedDate": 1730000000,
@@ -522,12 +535,14 @@ client credentials. Request: `{}`. The response never contains secret material.
 ```
 
 `Source` is `static` or `managed`. `CreatedDate`, `LastUpdatedDate` and
-`CreatedBy` are present only for managed entries. Static entries are read-only
-through the API.
+`CreatedBy` are present only for managed entries. Static entries are fixed at
+boot and cannot be modified through the API; `ReadOnly` reports whether the
+credential itself can mutate, delete, restore or tag secrets.
 
 ### 5.15 CreateClientCredential
 
-**Local extension, admin-only.** Creates a prefix-scoped, non-admin client.
+**Local extension, admin-only, loopback admin listener only.** Creates a
+prefix-scoped, non-admin client.
 
 ```json
 {
@@ -555,6 +570,7 @@ Response (the secret is returned here and by `GetClientCredential`):
   "SessionToken": "",
   "Description": "ACME billing integration",
   "AllowedPrefixes": ["client/acme/"],
+  "ReadOnly": false,
   "Source": "managed",
   "CreatedDate": 1730000000,
   "LastUpdatedDate": 1730000000,
@@ -571,8 +587,8 @@ and volume backups.
 
 ### 5.16 GetClientCredential
 
-**Local extension, admin-only.** Returns the credential including its secret.
-Identify it by `Name` or `AccessKeyId`:
+**Local extension, admin-only, loopback admin listener only.** Returns the
+credential including its secret. Identify it by `Name` or `AccessKeyId`:
 
 ```json
 { "Name": "acme" }
@@ -590,7 +606,8 @@ Treat the response as sensitive.
 
 ### 5.17 DeleteClientCredential
 
-**Local extension, admin-only.** Revokes a managed credential immediately.
+**Local extension, admin-only, loopback admin listener only.** Revokes a
+managed credential immediately.
 
 ```json
 { "Name": "acme" }

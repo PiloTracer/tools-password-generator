@@ -1,0 +1,56 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "/mnt/work/Projects/pilo.ai.logicbison/START_HERE.md",
+    "/mnt/work/Projects/pilo.ai.logicbison/PROCESS_ROUTER.md",
+    "../pilo.ai.ui.logicbison/START_HERE.md",
+    "../pilo.ai.ui.logicbison/COHABITATION.md",
+    "../pilo.ai.biz.logicbison/START_HERE.md",
+    "../pilo.ai.soc.logicbison/START_HERE.md",
+    "../pilo.ai.cto.logicbison/START_HERE.md",
+    "../pilo.ai.flutter.logicbison/START_HERE.md",
+    "../pilo.ai.flutter.logicbison/COHABITATION.md",
+    "../pilo.ai.mlt.logicbison/START_HERE.md"
+  ],
+  "references": {
+    "ai": {
+      "path": "/mnt/work/Projects/pilo.ai.logicbison",
+      "description": "Agent OS: skills, standards, concepts, workflow guides"
+    },
+    "ai-ui": {
+      "path": "../pilo.ai.ui.logicbison",
+      "description": "UI Design OS: UI component specs, design tokens, accessibility"
+    },
+    "ai-biz": {
+      "path": "../pilo.ai.biz.logicbison",
+      "description": "Business OS: strategy, brand, content, pricing"
+    },
+    "ai-soc": {
+      "path": "../pilo.ai.soc.logicbison",
+      "description": "Security OS: autonomous AI security testing, penetration testing, vulnerability assessment"
+    },
+    "ai-cto": {
+      "path": "../pilo.ai.cto.logicbison",
+      "description": "CTO Professor OS: technical leadership, architecture consulting, mentoring"
+    },
+    "ai-flutter": {
+      "path": "../pilo.ai.flutter.logicbison",
+      "description": "Flutter Agent OS: Flutter app development, design systems, release"
+    },
+    "ai-mlt": {
+      "path": "../pilo.ai.mlt.logicbison",
+      "description": "MLT Agent OS: machine-learning training, labs, mentoring"
+    }
+  },
+  "skills": {
+    "paths": [
+      "/mnt/work/Projects/pilo.ai.logicbison/skills",
+      "../pilo.ai.ui.logicbison/skills",
+      "../pilo.ai.biz.logicbison/skills",
+      "../pilo.ai.soc.logicbison/skills",
+      "../pilo.ai.cto.logicbison/skills",
+      "../pilo.ai.flutter.logicbison/skills",
+      "../pilo.ai.mlt.logicbison/skills"
+    ]
+  }
+}

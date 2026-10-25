@@ -4,6 +4,8 @@ FROM node:22-alpine
 
 ENV NODE_ENV=production \
     SM_PORT=8080 \
+    SM_ADMIN_HOST=127.0.0.1 \
+    SM_ADMIN_PORT=8081 \
     SM_DATA_DIR=/data \
     SM_LOG_LEVEL=info
 

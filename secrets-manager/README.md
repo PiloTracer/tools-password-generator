@@ -159,7 +159,12 @@ It checks:
 - soft delete → inaccessible → restore → accessible;
 - force delete cleanup;
 - `InvalidSignatureException` for a wrong secret key and a wrong region;
-- `ListClientCredentials` with the instance credential;
+- the loopback admin listener and `ListClientCredentials` with the instance
+  credential;
+- all four `*ClientCredential` operations rejected on the public listener;
+- when the app is running, that it uses a scoped credential, can read its policy
+  secret, is read-only, cannot manage clients, and cannot read another prefix;
+- that the admin listener is not reachable from the app container;
 - with `--sdk`: `@aws-sdk/client-secrets-manager` (ListSecrets + GetSecretValue)
   from a throwaway Node container on the Compose network;
 - with `--boto3`: `boto3` (ListSecrets + GetSecretValue) from a throwaway
@@ -194,17 +199,29 @@ The API reference is [API.md](API.md); the OpenAPI document is
 ## Client credentials
 
 The primary `SM_ACCESS_KEY_ID` principal is the full-access instance admin.
-Scoped clients are either static (`SM_CLIENTS_JSON`, read-only at runtime) or
-managed (created through the admin-only `*ClientCredential` operations and
-stored encrypted in `store.json`).
+Scoped clients are either static (`SM_CLIENTS_JSON`, fixed at boot) or managed
+(created through the admin-only `*ClientCredential` operations and stored
+encrypted in `store.json`).
+
+The four `*ClientCredential` operations are served **only** on the container's
+loopback admin listener (`127.0.0.1:8081`, `SM_ADMIN_PORT`). The public listener
+(`SM_PORT`, normally `8080`) returns `AccessDeniedException` for them, and the
+production nginx edge returns `403`. The listener is not published by Compose;
+use `./bin/start.sh credentials <env> ...`, or set
+`SM_ENDPOINT=http://127.0.0.1:8081` for a direct call inside the container.
 
 ```bash
-# Inside the container (or via ./bin/start.sh credentials <env> ...)
-node cli.mjs list-client-credentials
-node cli.mjs create-client-credential acme \
+# Recommended: the control script selects the admin listener automatically.
+./bin/start.sh credentials dev list
+./bin/start.sh credentials dev create acme \
   --description "ACME billing" --prefixes client/acme/
-node cli.mjs get-client-credential acme
-node cli.mjs delete-client-credential acme
+./bin/start.sh credentials dev show acme
+./bin/start.sh credentials dev delete acme --yes
+
+# Direct call inside the running container (admin listener required):
+docker compose --env-file .env.dev -f docker-compose.dev.yml exec -T \
+  -e SM_ENDPOINT=http://127.0.0.1:8081 secrets-manager \
+  node cli.mjs list-client-credentials
 ```
 
 - Client names are 1–64 characters (`A-Z a-z 0-9 . _ -`), unique against static
@@ -212,11 +229,14 @@ node cli.mjs delete-client-credential acme
 - `AllowedPrefixes` is required at boot for static clients and defaults to
   `client/<name>/` for managed clients. Every prefix is normalized to end in
   `/`; a client can only touch secret names that start with one of its prefixes.
+- A static client with `"readOnly": true` can read, list and describe secrets
+  within its prefixes but cannot create, update, delete, restore or tag them.
+  The password generator uses such a client for `password-generator/<env>/`.
 - Managed clients are always non-admin. Only the instance credential can list,
-  read, create or delete client credentials.
+  read, create or delete client credentials, and only on the admin listener.
 - `ListClientCredentials` returns `Name`, `AccessKeyId`, `Description`,
-  `AllowedPrefixes`, `Source` (`static`/`managed`), and for managed entries
-  `CreatedDate`, `LastUpdatedDate` and `CreatedBy`.
+  `AllowedPrefixes`, `ReadOnly`, `Source` (`static`/`managed`), and for managed
+  entries `CreatedDate`, `LastUpdatedDate` and `CreatedBy`.
 - `CreateClientCredential` and `GetClientCredential` return `SecretAccessKey`;
   `ListClientCredentials` never does. `DeleteClientCredential` removes the
   credential from memory immediately, so its key stops working on the next
@@ -228,7 +248,9 @@ node cli.mjs delete-client-credential acme
 
 | Variable | Default | Description |
 |---|---|---|
-| `SM_PORT` | `8080` | HTTP port |
+| `SM_PORT` | `8080` | Public HTTP port |
+| `SM_ADMIN_HOST` | `127.0.0.1` | Loopback admin listener host |
+| `SM_ADMIN_PORT` | `8081` | Loopback admin listener port |
 | `SM_HOST` | `0.0.0.0` | Bind address |
 | `SM_DATA_DIR` | `/data` | Store directory |
 | `SM_REGION` | `us-east-1` | SigV4/ARN region |
@@ -236,7 +258,7 @@ node cli.mjs delete-client-credential acme
 | `SM_ACCESS_KEY_ID` | — | Required when auth is on |
 | `SM_SECRET_ACCESS_KEY` | — | Required when auth is on |
 | `SM_SESSION_TOKEN` | — | Optional; verified when set |
-| `SM_CLIENTS_JSON` | — | Optional JSON array of **static** scoped clients: `accessKeyId`, `secretAccessKey`, optional `sessionToken`, `name`, `description`, `allowedPrefixes`. Runtime clients are managed through the admin API and stored in the volume. |
+| `SM_CLIENTS_JSON` | — | Optional JSON array of **static** scoped clients: `accessKeyId`, `secretAccessKey`, optional `sessionToken`, `name`, `description`, `allowedPrefixes`, optional `readOnly`. Runtime clients are managed through the admin API and stored in the volume. |
 | `SM_REQUIRE_AUTH` | `true` | `false` disables verification (debug only) |
 | `SM_MASTER_KEY` | — | 32-byte key, hex or base64 |
 | `SM_MAX_SECRET_BYTES` | `65536` | Value limit |

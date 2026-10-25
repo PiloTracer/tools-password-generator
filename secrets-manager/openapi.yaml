@@ -16,7 +16,9 @@ info:
     target to its request and response schema.
 
     The `*ClientCredential` operations are local, admin-only extensions for
-    scoped client lifecycle management. They are not AWS APIs.
+    scoped client lifecycle management. They are only served on the container's
+    loopback admin listener (127.0.0.1:8081 inside the container) and are
+    rejected by the public listener and by the public edge. They are not AWS APIs.
 
     See `API.md` for the full prose reference and `bin/verify-secrets-manager.sh`
     for an executable compatibility test.
@@ -26,9 +28,11 @@ servers:
   - url: https://secrets.agiolab.com
     description: Public production endpoint (host nginx TLS on port 443)
   - url: http://127.0.0.1:18001
-    description: Host loopback endpoint for administration (not public)
+    description: Host loopback endpoint (proxied to the public listener; admin *ClientCredential targets are blocked)
   - url: http://secrets-manager:8080
     description: Internal Docker Compose network
+  - url: http://127.0.0.1:8081
+    description: Container loopback admin listener (client-credential operations only; not reachable from other containers)
 tags:
   - name: Operations
     description: AWS Secrets Manager JSON 1.1 operations
@@ -777,6 +781,9 @@ components:
           maxItems: 16
           items:
             type: string
+        ReadOnly:
+          type: boolean
+          description: When true, the client cannot mutate secrets. Static clients only.
         Source:
           type: string
           enum: [static, managed]

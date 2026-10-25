@@ -6,6 +6,7 @@ import { isPlainObject } from "./util.mjs";
  *   accessKeyId?: string,
  *   name?: string,
  *   admin?: boolean,
+ *   readOnly?: boolean,
  *   allowedPrefixes?: string[],
  * }} Principal
  */
@@ -19,6 +20,13 @@ function isAdmin(principal) {
 function assertAdmin(principal) {
   if (!isAdmin(principal)) {
     throw accessDenied("Only the instance administrator can manage client credentials.");
+  }
+}
+
+/** @param {Principal|null|undefined} principal */
+function assertWritable(principal) {
+  if (principal?.readOnly === true) {
+    throw accessDenied("This credential is read-only and cannot modify secrets.");
   }
 }
 
@@ -81,6 +89,7 @@ const HANDLERS = Object.freeze({
   },
   CreateSecret: (store, input, principal) => {
     assertNameAllowed(input.Name, principal);
+    assertWritable(principal);
     return store.createSecret(input);
   },
   DeleteClientCredential: (store, input, principal) => {
@@ -89,6 +98,7 @@ const HANDLERS = Object.freeze({
   },
   DeleteSecret: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
+    assertWritable(principal);
     return store.deleteSecret(input);
   },
   DescribeSecret: (store, input, principal) => {
@@ -116,22 +126,27 @@ const HANDLERS = Object.freeze({
     store.listSecrets(input, scopePrefixes(principal)),
   PutSecretValue: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
+    assertWritable(principal);
     return store.putSecretValue(input);
   },
   RestoreSecret: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
+    assertWritable(principal);
     return store.restoreSecret(input);
   },
   TagResource: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
+    assertWritable(principal);
     return store.tagResource(input);
   },
   UntagResource: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
+    assertWritable(principal);
     return store.untagResource(input);
   },
   UpdateSecret: (store, input, principal) => {
     assertSecretAllowed(store, input, principal);
+    assertWritable(principal);
     return store.updateSecret(input);
   },
 });

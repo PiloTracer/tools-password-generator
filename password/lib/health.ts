@@ -65,7 +65,13 @@ export async function collectHealth(): Promise<HealthReport> {
 
   return {
     status,
-    ready: status !== "error" && secretsStatus.status !== "degraded",
+    // Readiness answers "can this instance serve generation?", which is the only
+    // thing an orchestrator or load balancer can act on. The Secrets Manager is
+    // an optional policy source: the app deliberately falls back to defaults
+    // when it is unreachable, so a degraded policy layer is reported (status
+    // "degraded") but must not remove a working instance from service. Only a
+    // broken generator or an unenforced integrity policy makes it unready.
+    ready: status !== "error",
     environment: process.env.APP_ENV?.trim() || "unknown",
     version: process.env.APP_VERSION?.trim() || "unknown",
     uptimeSeconds: Math.round(process.uptime()),
@@ -81,4 +87,41 @@ export async function collectHealth(): Promise<HealthReport> {
       requestsPerMinute: config.limits.requestsPerMinute,
     },
   };
+}
+
+/**
+ * Strip deployment internals before a report leaves the process.
+ *
+ * The public probes are unauthenticated. Absolute script paths, the word-list
+ * path and its expected/actual digests are reconnaissance material (a caller can
+ * tune around the integrity check and learn the on-disk layout), so they are
+ * only served when `HEALTH_VERBOSE=true` is set deliberately by the operator.
+ */
+export function publicHealthReport(report: HealthReport): Record<string, unknown> {
+  return {
+    status: report.status,
+    ready: report.ready,
+    environment: report.environment,
+    version: report.version,
+    uptimeSeconds: report.uptimeSeconds,
+    checkedAt: report.checkedAt,
+    checks: {
+      generator: { ok: report.checks.generator.ok },
+      secretsManager: {
+        status: report.checks.secretsManager.status,
+        source: report.checks.secretsManager.source,
+      },
+      wordlist: {
+        state: report.checks.wordlist.state,
+        checked: report.checks.wordlist.checked,
+        enforcement: report.checks.wordlist.enforcement,
+      },
+    },
+    policy: report.policy,
+  };
+}
+
+/** True when the operator opted into the detailed probe payload. */
+export function verboseHealthEnabled(): boolean {
+  return process.env.HEALTH_VERBOSE?.trim().toLowerCase() === "true";
 }

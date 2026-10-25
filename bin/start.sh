@@ -47,6 +47,7 @@ RUN_DIR="$ROOT_DIR/.run"
 
 APP_SERVICE="app"
 SECRETS_SERVICE="secrets-manager"
+APP_CREDENTIAL_OVERRIDE=""
 
 REQUESTED_ENV=""
 APP_ENV_RESOLVED=""
@@ -138,6 +139,8 @@ Commands:
   restart              Restart containers without rebuilding
   recreate             Recreate containers to apply .env / compose changes
   rebuild              Force rebuild without cache, then recreate
+  rollback [stamp]     Retag images to a build snapshot and recreate (undo a bad deploy)
+  rollback --list      List available build snapshots
   status               Services, ports, volumes and latest backup
   logs [service]       Logs for app / secrets-manager (--follow, --tail N)
   health [--strict]    App and Secrets Manager health
@@ -148,6 +151,7 @@ Commands:
   cleanup <scope>      containers | volumes | images | backups | all | dangling
   credentials [sub]    list | show <name> | create <name> | delete <name>
                        Scoped client credentials (--json, --description, --prefixes)
+                       Served only on the container-loopback admin listener
   secrets <sub>        list | get | put | create | describe | delete |
                        seed | test | verify | endpoint | random | raw |
                        credentials [list|show|create|delete] ...
@@ -218,6 +222,10 @@ sha256_file() {
   else
     return 1
   fi
+}
+
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf 'unknown'
 }
 
 write_checksum_file() {
@@ -404,6 +412,7 @@ resolve_env() {
   set +a
 
   PROJECT="${COMPOSE_PROJECT_NAME:-passwordgenerator_$candidate}"
+  APP_CREDENTIAL_OVERRIDE="$RUN_DIR/compose.app-credentials.$candidate.yml"
   APP_PORT="${APP_PORT:-18000}"
   APP_DEBUG_PORT="${APP_DEBUG_PORT:-18002}"
   APP_BIND_ADDRESS="${APP_BIND_ADDRESS:-127.0.0.1}"
@@ -470,7 +479,15 @@ resolve_env() {
 # Docker Compose helpers
 # ---------------------------------------------------------------------------
 compose() {
-  docker compose --project-directory "$ROOT_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+  local -a files=("$COMPOSE_FILE")
+  if [ -n "${APP_CREDENTIAL_OVERRIDE:-}" ] && [ -f "${APP_CREDENTIAL_OVERRIDE:-}" ]; then
+    files+=("$APP_CREDENTIAL_OVERRIDE")
+  fi
+  local args=()
+  for file in "${files[@]}"; do
+    args+=(-f "$file")
+  done
+  docker compose --project-directory "$ROOT_DIR" --env-file "$ENV_FILE" "${args[@]}" "$@"
 }
 
 validate_compose() {
@@ -753,7 +770,11 @@ aws_sm() {
 }
 
 sm_cli() {
-  compose exec -T secrets-manager node cli.mjs "$@"
+  local endpoint="http://127.0.0.1:8080"
+  if compose exec -T secrets-manager node -e "fetch('http://127.0.0.1:8081/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" >/dev/null 2>&1; then
+    endpoint="http://127.0.0.1:8081"
+  fi
+  compose exec -T -e SM_ENDPOINT="$endpoint" secrets-manager node cli.mjs "$@"
 }
 
 require_sm_running() {
@@ -1025,10 +1046,167 @@ restore_sm_after_backup() {
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Image rollback
+#
+# Every build snapshots the images it is about to replace, so a bad deploy can
+# be reverted without a rebuild and without assuming the previous image still
+# exists. Snapshots are ordinary tags: <repo>:rollback-<UTC timestamp>.
+# ---------------------------------------------------------------------------
+IMAGE_ROLLBACK_KEEP="${IMAGE_ROLLBACK_KEEP:-5}"
+
+# Strip the tag from an image reference, tolerating registry:port/path forms.
+image_repo() {
+  local image="$1"
+  case "${image##*:}" in
+    */*) printf '%s\n' "$image" ;;
+    *)   printf '%s\n' "${image%:*}" ;;
+  esac
+}
+
+# Every rollback timestamp that exists for the stack's images.
+snapshot_stamps() {
+  local images="$1" image repo
+  for image in $images; do
+    repo="$(image_repo "$image")"
+    docker images "$repo" --format '{{.Tag}}' 2>/dev/null | grep '^rollback-' | sed 's/^rollback-//' || true
+  done | sort -u
+}
+
+# Tag the current stack images so the next build can be undone.
+snapshot_images() {
+  local images image repo stamp snap
+  images="$(compose config --images 2>/dev/null || true)"
+  [ -n "$images" ] || return 0
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  for image in $images; do
+    docker image inspect "$image" >/dev/null 2>&1 || continue
+    repo="$(image_repo "$image")"
+    snap="${repo}:rollback-${stamp}"
+    if docker image inspect "$snap" >/dev/null 2>&1; then
+      continue
+    fi
+    if docker tag "$image" "$snap" 2>/dev/null; then
+      info "Snapshot $image -> $snap"
+    else
+      warn "Could not snapshot $image"
+    fi
+  done
+  prune_image_snapshots || true
+  return 0
+}
+
+# Keep only the newest IMAGE_ROLLBACK_KEEP snapshots per repository.
+prune_image_snapshots() {
+  local keep="${IMAGE_ROLLBACK_KEEP:-5}" images image repo tags tag total drop idx=0
+  images="$(compose config --images 2>/dev/null || true)"
+  [ -n "$images" ] || return 0
+  for image in $images; do
+    repo="$(image_repo "$image")"
+    tags="$(docker images "$repo" --format '{{.Tag}}' 2>/dev/null | grep '^rollback-' | sort || true)"
+    [ -n "$tags" ] || continue
+    total="$(printf '%s\n' "$tags" | grep -c . || true)"
+    drop=$((total - keep))
+    [ "$drop" -gt 0 ] || continue
+    idx=0
+    for tag in $tags; do
+      idx=$((idx + 1))
+      [ "$idx" -le "$drop" ] || break
+      docker image rmi "$repo:$tag" >/dev/null 2>&1 || true
+    done
+  done
+  return 0
+}
+
+action_rollback() {
+  local requested="latest" images image repo original snap
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes|-y) ASSUME_YES=true ;;
+      --list|list|latest) requested="$1" ;;
+      -*) err "Unknown option for rollback: $1"; return 1 ;;
+      *) requested="$1" ;;
+    esac
+    shift
+  done
+  require_docker || return 1
+  validate_compose || return 1
+
+  images="$(compose config --images 2>/dev/null || true)"
+  if [ -z "$images" ]; then
+    err "Could not determine the stack images."
+    return 1
+  fi
+
+  if [ "$requested" = "--list" ] || [ "$requested" = "list" ]; then
+    section "Rollback snapshots ($APP_ENV_RESOLVED)"
+    local stamps
+    stamps="$(snapshot_stamps "$images")"
+    if [ -z "$stamps" ]; then
+      info "No snapshots yet. One is created on every build."
+    else
+      printf '%s\n' "$stamps" | sed 's/^/  /'
+    fi
+    return 0
+  fi
+
+  if [ "$requested" = "latest" ]; then
+    requested="$(snapshot_stamps "$images" | tail -n 1)"
+    if [ -z "$requested" ]; then
+      err "No rollback snapshots exist yet. One is created on every build."
+      return 1
+    fi
+  fi
+
+  section "Rollback $APP_ENV_RESOLVED to snapshot $requested"
+  if ! snapshot_stamps "$images" | grep -qx "$requested"; then
+    err "Snapshot '$requested' not found. Available:"
+    snapshot_stamps "$images" | sed 's/^/  /'
+    return 1
+  fi
+
+  if ! confirm "Retag the stack images to snapshot $requested and recreate?" yes; then
+    info "Cancelled."
+    return 1
+  fi
+
+  # Snapshot the current images first, so this rollback can itself be undone.
+  snapshot_images || warn "Could not snapshot the current images."
+
+  for image in $images; do
+    repo="$(image_repo "$image")"
+    original="${image##*:}"
+    case "$original" in */*) original="latest" ;; esac
+    snap="${repo}:rollback-${requested}"
+    if docker image inspect "$snap" >/dev/null 2>&1; then
+      info "Retag $snap -> ${repo}:${original}"
+      docker tag "$snap" "${repo}:${original}" || { err "Could not retag $snap"; return 1; }
+    else
+      warn "No snapshot for $repo; leaving it unchanged."
+    fi
+  done
+
+  info "Recreating containers from the restored images (no build)..."
+  compose up -d --no-build --force-recreate --remove-orphans || {
+    err "Rollback restart failed."
+    return 1
+  }
+  wait_for_healthy "$SECRETS_SERVICE" 120 || return 1
+  wait_for_healthy "$APP_SERVICE" 300 || return 1
+  print_access_summary
+  ok "Rolled back $APP_ENV_RESOLVED to snapshot $requested (data untouched)."
+  return 0
+}
+
+cmd_rollback() {
+  action_rollback "$@"
+}
+
 action_build() {
   local mode="${1:-cached}"
   require_docker || return 1
   validate_compose || return 1
+  snapshot_images || warn "Could not snapshot the current images; rollback will be limited."
   if [ "$mode" = "force" ]; then
     info "Rebuilding images without cache and pulling base images..."
     compose build --no-cache --pull || { err "Docker build failed."; return 1; }
@@ -1040,9 +1218,51 @@ action_build() {
   return 0
 }
 
+ensure_app_credentials() {
+  local output="" name="" source="" cred_file override_file run_mode cred_mode
+  if ! has python3; then
+    err "python3 is required to provision the application's scoped read-only credential."
+    err "Install python3 and retry; the app must not use the instance admin credential."
+    return 1
+  fi
+  if ! mkdir -p "$RUN_DIR" 2>/dev/null; then
+    err "Unable to create $RUN_DIR."
+    return 1
+  fi
+  chmod 700 "$RUN_DIR" 2>/dev/null || true
+  if ! output="$(python3 "$ROOT_DIR/bin/ensure-app-credentials.py" "$RUN_DIR" "$APP_ENV_RESOLVED" "${SM_CLIENTS_JSON:-[]}" "${SECRETS_MANAGER_ACCESS_KEY_ID:-}" 2>&1)"; then
+    err "$output"
+    return 1
+  fi
+  name="$(printf '%s' "$output" | awk '/^APP_CREDENTIAL / {print $2}')"
+  source="$(printf '%s' "$output" | awk '/^APP_CREDENTIAL / {print $3}')"
+  if [ -z "$name" ]; then
+    err "The application credential provisioning script did not report a client."
+    return 1
+  fi
+  cred_file="$RUN_DIR/app-credentials.$APP_ENV_RESOLVED.json"
+  override_file="$RUN_DIR/compose.app-credentials.$APP_ENV_RESOLVED.yml"
+  [ -f "$cred_file" ] && chmod 600 "$cred_file" 2>/dev/null || true
+  [ -f "$override_file" ] && chmod 600 "$override_file" 2>/dev/null || true
+  run_mode="$(file_mode "$RUN_DIR")"
+  if [ "$run_mode" != "700" ]; then
+    warn "The filesystem reports mode $run_mode for $RUN_DIR; private modes are not enforced."
+    warn "Use a POSIX filesystem (ext4/xfs) or restrict access to the host path yourself."
+  fi
+  if [ -f "$cred_file" ]; then
+    cred_mode="$(file_mode "$cred_file")"
+    if [ "$cred_mode" != "600" ]; then
+      warn "The application credential file is mode $cred_mode, not 600; protect $cred_file."
+    fi
+  fi
+  ok "App runtime credential: scoped/read-only client '$name' ($source)."
+  return 0
+}
+
 action_up() {
   local build="${1:-cached}" attach="${2:-false}" recreate_flag="" up_flag=""
   require_docker || return 1
+  ensure_app_credentials || return 1
   validate_compose || return 1
   preflight_start || return 1
 
@@ -1116,6 +1336,7 @@ action_restart() {
 
 action_recreate() {
   require_docker || return 1
+  ensure_app_credentials || return 1
   validate_compose || return 1
   preflight_start || return 1
   info "Recreating containers from the current images and .env.$APP_ENV_RESOLVED ..."
@@ -1130,6 +1351,7 @@ action_recreate() {
 
 action_rebuild() {
   require_docker || return 1
+  ensure_app_credentials || return 1
   validate_compose || return 1
   preflight_start || return 1
   action_build force || return 1
@@ -1415,6 +1637,59 @@ action_smoke() {
     smoke_fail "readiness probe (unreachable)"
   fi
 
+  # --- Health disclosure guard (web-surface SPEC R19, threat T13) ----------
+  if fetch_http "$(app_url)/api/health"; then
+    if printf '%s' "$HTTP_BODY" | grep -qE '/code/|/app/|"expected"|"actual"|\.txt"'; then
+      smoke_fail "health payload leaks deployment internals (paths or digests)"
+    else
+      smoke_pass "health payload exposes no paths or digests"
+    fi
+  else
+    smoke_fail "GET /api/health (unreachable)"
+  fi
+
+  # --- Abuse guards (web-surface SPEC R6, R7, R8) --------------------------
+  # These assert the *refusal* behaviour: a wrong content type, a cross-site
+  # caller and an oversized body must never reach the generator.
+  local probe_code probe_body
+  probe_code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: text/plain' \
+    --data-binary '{"mode":"words"}' \
+    "$(app_url)/api/generate" 2>/dev/null || echo 000)"
+  if [ "$probe_code" = "403" ]; then
+    smoke_pass "non-JSON content type is refused (403)"
+  else
+    smoke_fail "non-JSON content type returned $probe_code, expected 403"
+  fi
+
+  probe_code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    -H 'Origin: https://evil.example' \
+    --data-binary '{"mode":"words"}' \
+    "$(app_url)/api/generate" 2>/dev/null || echo 000)"
+  if [ "$probe_code" = "403" ]; then
+    smoke_pass "cross-site Origin is refused (403)"
+  else
+    smoke_fail "cross-site Origin returned $probe_code, expected 403"
+  fi
+
+  local big_file
+  big_file="$(mktemp "${TMPDIR:-/tmp}/pwdgen-smoke.XXXXXX")"
+  {
+    printf '{"mode":"words","pad":"'
+    head -c 40000 /dev/zero | tr '\0' 'x'
+    printf '"}'
+  } > "$big_file"
+  probe_code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' --data-binary "@$big_file" \
+    "$(app_url)/api/generate" 2>/dev/null || echo 000)"
+  rm -f "$big_file"
+  if [ "$probe_code" = "413" ]; then
+    smoke_pass "oversized body is refused (413)"
+  else
+    smoke_fail "oversized body returned $probe_code, expected 413"
+  fi
+
   section "Smoke test result"
   printf '  Passed: %s\n  Failed: %s\n' "$passes" "$failures"
   if [ "$failures" -gt 0 ]; then
@@ -1667,6 +1942,7 @@ EOF
   fi
 
   info "Starting the stack after restore..."
+  ensure_app_credentials || warn "Could not refresh the application runtime credential; existing containers may be used."
   compose up -d --remove-orphans || { err "Could not start the stack after restore."; return 1; }
   wait_for_healthy "$SECRETS_SERVICE" 120 || warn "The Secrets Manager is not healthy yet."
   seed_secrets false || warn "Secret seeding failed (existing secrets may already be present)."
@@ -1990,6 +2266,7 @@ action_secrets_verify() {
 action_secrets_endpoint() {
   section "AWS-compatible Secrets Manager endpoint ($APP_ENV_RESOLVED)"
   printf '  Endpoint:   %s\n' "$(sm_url)"
+  printf '  Admin:      http://127.0.0.1:8081 (inside the container; client credentials only)\n'
   printf '  Region:     %s\n' "$SECRETS_MANAGER_REGION"
   printf '  Access key: %s\n' "$SECRETS_MANAGER_ACCESS_KEY_ID"
   printf '  Secret key: %s  (stored in %s)\n' "$(redact "$SECRETS_MANAGER_SECRET_ACCESS_KEY")" "$(basename "$ENV_FILE")"
@@ -2013,6 +2290,10 @@ action_secrets_endpoint() {
     ./bin/start.sh credentials $APP_ENV_RESOLVED list
     ./bin/start.sh credentials $APP_ENV_RESOLVED create <name> --description "..."
     ./bin/start.sh credentials $APP_ENV_RESOLVED show <name>
+
+  Client-credential management is served only on the container-loopback admin
+  listener (127.0.0.1:8081) and is rejected by the public endpoint and edge.
+  The commands above select it automatically.
 EOF
 }
 
@@ -2114,6 +2395,8 @@ record = {
     "AllowedPrefixes": [
         str(prefix) for prefix in (entry.get("allowedPrefixes") or [])
     ],
+    "ReadOnly": entry.get("readOnly") is True
+    or str(entry.get("readOnly") or "").strip().lower() == "true",
     "Source": "static",
 }
 print(json.dumps(record))
@@ -2160,6 +2443,8 @@ for entry in entries:
             "AllowedPrefixes": [
                 str(prefix) for prefix in (entry.get("allowedPrefixes") or [])
             ],
+            "ReadOnly": entry.get("readOnly") is True
+            or str(entry.get("readOnly") or "").strip().lower() == "true",
             "Source": "static",
         }
     )
@@ -2237,7 +2522,7 @@ def text(value, limit=48):
     return value or "-"
 
 
-headers = ["NAME", "SOURCE", "ACCESS KEY ID", "PREFIXES", "DESCRIPTION"]
+headers = ["NAME", "SOURCE", "ACCESS KEY ID", "PREFIXES", "READ-ONLY", "DESCRIPTION"]
 rows = []
 for client in clients:
     rows.append(
@@ -2246,6 +2531,7 @@ for client in clients:
             text(client.get("Source")),
             text(client.get("AccessKeyId")),
             text(",".join(client.get("AllowedPrefixes") or []) or "-"),
+            "yes" if client.get("ReadOnly") else "no",
             text(client.get("Description") or "-"),
         ]
     )
@@ -2477,6 +2763,8 @@ action_config() {
   printf '  Env file:          %s\n' "$ENV_FILE"
   printf '  App URL:           %s\n' "$(app_url)"
   printf '  Secrets endpoint:  %s\n' "$(sm_url)"
+  printf '  Admin listener:    http://127.0.0.1:8081 (inside the Secrets Manager container)\n'
+  printf '  App credential:    %s\n' "$(if [ -f "$RUN_DIR/app-credentials.$APP_ENV_RESOLVED.json" ]; then printf 'provisioned (scoped, read-only)'; elif [ -f "$APP_CREDENTIAL_OVERRIDE" ]; then printf 'provisioned (static SM_CLIENTS_JSON client)'; else printf 'not provisioned'; fi)"
   printf '  Public app:        %s\n' "$(app_public_url)"
   printf '  Public secrets:    %s\n' "$(sm_public_url)"
   printf '  Public HTTPS port: %s\n' "$PUBLIC_HTTPS_PORT"
@@ -2576,6 +2864,25 @@ action_doctor() {
     doctor_pass "port $SECRETS_MANAGER_PORT is free"
   fi
 
+  local app_key="" app_cred="" app_mode=""
+  if is_running app; then
+    app_key="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$(service_id app)" 2>/dev/null | sed -n 's/^AWS_ACCESS_KEY_ID=//p' | head -n 1)"
+    if [ -n "$app_key" ] && [ "$app_key" = "$SECRETS_MANAGER_ACCESS_KEY_ID" ]; then
+      doctor_fail "the app container uses the instance admin credential; run ./bin/start.sh recreate $APP_ENV_RESOLVED"
+    elif [ -n "$app_key" ]; then
+      doctor_pass "the app container uses a scoped Secrets Manager credential"
+    else
+      doctor_warn "could not read the app container credential"
+    fi
+  fi
+  if is_running "$SECRETS_SERVICE"; then
+    if compose exec -T secrets-manager node -e "fetch('http://127.0.0.1:8081/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" >/dev/null 2>&1; then
+      doctor_pass "Secrets Manager admin listener is available (127.0.0.1:8081)"
+    else
+      doctor_warn "Secrets Manager admin listener is unavailable; rebuild/recreate to enable credential management"
+    fi
+  fi
+
   other_env="prd"
   [ "$APP_ENV_RESOLVED" = "prd" ] && other_env="dev"
   other_project="$(project_for_env "$other_env")"
@@ -2613,7 +2920,24 @@ action_doctor() {
   fi
 
   if has aws; then doctor_pass "AWS CLI is available"; else doctor_warn "AWS CLI is not installed (optional; the bundled client works)"; fi
-  if has python3; then doctor_pass "python3 is available on the host"; else doctor_warn "python3 is not on the host (only needed for CLI tests outside Docker)"; fi
+  if has python3; then
+    doctor_pass "python3 is available on the host"
+    app_cred="$RUN_DIR/app-credentials.$APP_ENV_RESOLVED.json"
+    if [ -f "$app_cred" ]; then
+      app_mode="$(file_mode "$app_cred")"
+      if [ "$app_mode" = "600" ]; then
+        doctor_pass "application credential file is private (mode 600)"
+      else
+        doctor_warn "application credential file is mode $app_mode; protect $app_cred"
+      fi
+    elif [ -f "$APP_CREDENTIAL_OVERRIDE" ]; then
+      doctor_pass "application credential override is present (static SM_CLIENTS_JSON client)"
+    else
+      doctor_warn "application credential is not provisioned yet; run ./bin/start.sh up or recreate"
+    fi
+  else
+    doctor_fail "python3 is required by ./bin/start.sh up/recreate to scope the app credential"
+  fi
   if has git; then doctor_pass "git is available"; else doctor_warn "git is not installed (backup metadata will say unknown)"; fi
   if [ -f "$ROOT_DIR/eff_short_wordlist_1.txt" ]; then doctor_pass "word list is present"; else doctor_fail "eff_short_wordlist_1.txt is missing"; fi
   if [ -f "$ROOT_DIR/password_generator.py" ]; then doctor_pass "password_generator.py is present"; else doctor_fail "password_generator.py is missing"; fi
@@ -3377,7 +3701,7 @@ main() {
       printf '%s %s\n' "$(basename "$0")" "$VERSION"
       return 0
       ;;
-    ""|menu|up|start|down|stop|restart|recreate|rebuild|status|logs|health|smoke|backup|restore|backups|cleanup|secrets|credentials|client-credentials|shell|exec|test-cli|config|check-env|doctor)
+    ""|menu|up|start|down|stop|restart|recreate|rebuild|rollback|status|logs|health|smoke|backup|restore|backups|cleanup|secrets|credentials|client-credentials|shell|exec|test-cli|config|check-env|doctor)
       ;;
     *)
       err "Unknown command: $command"
@@ -3411,6 +3735,10 @@ main() {
     restart) cmd_restart ;;
     recreate) cmd_recreate ;;
     rebuild) cmd_rebuild ;;
+    rollback)
+      shift
+      cmd_rollback "$@"
+      ;;
     status) cmd_status ;;
     logs)
       shift

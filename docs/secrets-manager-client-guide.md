@@ -269,7 +269,12 @@ reference for details.
 The server also exposes four local, admin-only extensions for credential
 lifecycle (`CreateClientCredential`, `ListClientCredentials`,
 `GetClientCredential`, `DeleteClientCredential`). They are not part of the AWS
-API and are not available to scoped client credentials.
+API and are not available to scoped client credentials. They are served only
+on the Secrets Manager container's loopback admin listener (`127.0.0.1:8081`
+inside the container) and are rejected by the public listener and by the public
+edge, even with the instance credential. Use `./bin/start.sh credentials …`
+(which runs inside the container) or `SM_ENDPOINT=http://127.0.0.1:8081`
+inside the container.
 
 ---
 

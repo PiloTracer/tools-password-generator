@@ -59,9 +59,10 @@ host at a time** (`start.sh` enforces this):
 
 ## 2. Quick start
 
-Requirements: Docker 24+ with Compose v2, Bash 3.2+, `curl`, `tar`, and
-`sha256sum`/`shasum`/`openssl`. Optional: `aws` CLI v2 for AWS-protocol tests,
-`python3` for host-side CLI tests, `jq` for pretty JSON.
+Requirements: Docker 24+ with Compose v2, Bash 3.2+, `curl`, `tar`,
+`sha256sum`/`shasum`/`openssl`, and `python3` (`start.sh` uses it to provision
+the application's scoped Secrets Manager credential). Optional: `aws` CLI v2 for
+AWS-protocol tests, `jq` for pretty JSON.
 
 ```bash
 # Interactive menu (recommended)
@@ -211,6 +212,11 @@ Without it, `APP_ENV` from your shell is used, then `dev`.
 | `check-env` | Verify `.env.example` / `.env.dev` / `.env.prd` parity |
 | `doctor` | Prerequisites, LF endings, ports, parity, Compose validity, images |
 | `help` | Full usage |
+
+`up`, `recreate` and `rebuild` also provision the application's scoped,
+read-only Secrets Manager credential (persisted under `.run/`). The four
+`*ClientCredential` operations run only on the Secrets Manager container's
+loopback admin listener; the public endpoint and the nginx edge reject them.
 
 Examples:
 
@@ -373,10 +379,10 @@ The protocol details:
 | `TagResource` / `UntagResource` | Tag management |
 | `BatchGetSecretValue` | Up to 20 ids, per-secret errors |
 | `GetRandomPassword` | Character classes, exclusions, length |
-| `CreateClientCredential` | **Extension, admin-only:** scoped client + optional `Description` |
-| `ListClientCredentials` | **Extension, admin-only:** static + managed metadata (never secrets) |
-| `GetClientCredential` | **Extension, admin-only:** read a client's secret |
-| `DeleteClientCredential` | **Extension, admin-only:** revoke a managed client |
+| `CreateClientCredential` | **Extension, admin-only, local listener only:** scoped client + optional `Description` |
+| `ListClientCredentials` | **Extension, admin-only, local listener only:** static + managed metadata (never secrets) |
+| `GetClientCredential` | **Extension, admin-only, local listener only:** read a client's secret |
+| `DeleteClientCredential` | **Extension, admin-only, local listener only:** revoke a managed client |
 
 Unsupported AWS features (KMS rotation lambdas, resource policies, replication,
 managed rotation) return protocol-compatible errors or are stored as metadata.
@@ -446,7 +452,7 @@ instance credential. Scoped client credentials come from two places:
 
 | Source | Provisioned by | Lifecycle |
 |---|---|---|
-| `static` | `SM_CLIENTS_JSON` in `.env.<env>` | read-only through the API; edit the env file and recreate the container |
+| `static` | `SM_CLIENTS_JSON` in `.env.<env>` (and the generated app override) | fixed at boot; edit the env file and recreate the container |
 | `managed` | `CreateClientCredential` / `./bin/start.sh credentials … create` | stored encrypted in the data volume; survives restart, backup and restore |
 
 Managed credentials are always prefix-scoped and non-admin. They accept an
@@ -454,7 +460,15 @@ optional `Description` and a list of `AllowedPrefixes` (default
 `client/<name>/`). `CreateClientCredential` returns the generated secret once;
 `GetClientCredential` can retrieve it again for an administrator;
 `ListClientCredentials` returns metadata only and never secret material. Static
-`SM_CLIENTS_JSON` entries may also carry an optional `description`.
+`SM_CLIENTS_JSON` entries may also carry an optional `description` and
+`readOnly` (a read-only client cannot mutate, delete, restore or tag secrets).
+
+The four `*ClientCredential` operations are served **only** on the Secrets
+Manager container's loopback admin listener (`http://127.0.0.1:8081`). The
+public listener and the host nginx edge reject them, even with the instance
+admin credential. `./bin/start.sh credentials` selects the admin listener
+automatically; a direct `cli.mjs` call inside the container must set
+`SM_ENDPOINT=http://127.0.0.1:8081`.
 
 ```bash
 ./bin/start.sh credentials dev list
@@ -484,12 +498,21 @@ credentials.
 ### How the app uses it
 
 At runtime the server-side API fetches two secrets with SigV4 (never from the
-browser):
+browser). It authenticates with an auto-generated, prefix-scoped, **read-only**
+static client for `password-generator/<env>/`; the full-access instance
+credential is never given to the app container:
 
 - `password-generator/<env>/app-config` — limits, features, rate limit and the
   word-list enforcement policy;
 - `password-generator/<env>/integrity` — the expected SHA-256 of
   `eff_short_wordlist_1.txt`, checked on every passphrase request (cached).
+
+`./bin/start.sh up` and `recreate` provision that client, persist it under
+`.run/app-credentials.<env>.json`, and add it to the Secrets Manager through a
+generated Compose override. The override is written with mode `600` on POSIX
+filesystems. To rotate the app credential, delete the persisted file and run
+`./bin/start.sh recreate <env>`; the old static client disappears when the
+containers are recreated.
 
 The policy secret looks like this:
 
@@ -519,13 +542,31 @@ The policy secret looks like this:
 
 `wordlist.enforcement` can be `off`, `warn` or `enforce`. `warn` (the seeded
 value) keeps passphrase generation available if the word list changes without
-re-seeding; `enforce` returns `503` on a digest mismatch. `requestsPerMinute: 0`
-disables rate limiting.
+re-seeding; `enforce` returns `503` on a digest mismatch.
+
+`limits.requestsPerMinute` is per client IP:
+
+| Value | Effect |
+|---|---|
+| absent, empty, non-numeric, negative, or a fraction below 1 | the built-in default of **30** is applied — a missing or mistyped value never removes throttling |
+| `0` | throttling is disabled (the documented switch) |
+| `1`–`6000` | that many requests per minute, floored to a whole number |
+
+The default is deliberately below the edge limit (20 r/m with burst 10), so a
+degraded policy layer tightens abuse limits instead of loosening them. The seed
+sets 30 for `prd` and 120 for `dev`; an existing secret keeps whatever value it
+already holds until it is re-seeded.
 
 The app caches the policy for `SECRETS_CACHE_TTL_MS`. If the Secrets Manager is
 unavailable it logs a throttled warning and falls back to the built-in defaults,
-so password generation keeps working. `/api/health` reports `degraded` and
-`/api/ready` returns `503` in that state, while `/api/health` stays `200`.
+so password generation keeps working. `/api/health` reports `degraded`, and
+`/api/ready` stays `200` because the instance can still generate — readiness is
+withdrawn only when generation itself is broken.
+
+`/api/health` is unauthenticated, so it returns only capability signals: no
+absolute paths, no word-list digest, no error text. Set `HEALTH_VERBOSE=true`
+on the app service to expose the full diagnostic report (useful on a private
+host, not on the public edge).
 
 Seeding is idempotent and happens automatically before the app starts. To
 overwrite existing values (for example after changing the word list):
@@ -538,14 +579,16 @@ overwrite existing values (for example after changing the word list):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SM_PORT` | `8080` | Listen port |
+| `SM_PORT` | `8080` | Public listen port |
+| `SM_ADMIN_HOST` | `127.0.0.1` | Loopback admin listener host (local only) |
+| `SM_ADMIN_PORT` | `8081` | Loopback admin listener port (client-credential operations only) |
 | `SM_DATA_DIR` | `/data` | Encrypted store directory |
 | `SM_REGION` | `us-east-1` | SigV4 region / ARN region |
 | `SM_ACCOUNT_ID` | `000000000000` | ARN account |
 | `SM_ACCESS_KEY_ID` | — | SigV4 access key (required) |
 | `SM_SECRET_ACCESS_KEY` | — | SigV4 secret (required) |
 | `SM_SESSION_TOKEN` | — | Optional session token |
-| `SM_CLIENTS_JSON` | — | Static bootstrap scoped clients (JSON array): `name`, `accessKeyId`, `secretAccessKey`, optional `description`, `allowedPrefixes`; managed clients are created at runtime |
+| `SM_CLIENTS_JSON` | — | Static bootstrap scoped clients (JSON array): `name`, `accessKeyId`, `secretAccessKey`, optional `description`, `allowedPrefixes`, optional `readOnly` (`true` blocks all mutating operations); managed clients are created at runtime |
 | `SM_REQUIRE_AUTH` | `true` | Set `false` only for isolated debugging |
 | `SM_MASTER_KEY` | — | 32-byte hex/base64 key; else `master.key` |
 | `SM_MAX_SECRET_BYTES` | `65536` | Per-value limit |
@@ -609,6 +652,11 @@ be reached or an enforced word-list check fails.
   configurable through the policy secret.
 - The Secrets Manager runs read-only, drops all capabilities, uses `init: true`
   and logs through a size-limited `json-file` driver.
+- `up`/`recreate` provision the app's scoped read-only credential and abort if
+  it cannot be created; they never silently fall back to the admin credential.
+- Credential management is served only on the container-loopback admin listener;
+  `start.sh` probes it and falls back to the public listener only for
+  pre-upgrade images that predate the admin listener.
 - Health checks use the container's own Node runtime; no shell tooling needed.
 
 ### Configuration
@@ -738,6 +786,7 @@ npm run build
 ├── bin/start.sh                  # control plane (menu + commands)
 ├── bin/check-env-parity.sh       # .env.example / dev / prd parity gate
 ├── bin/verify-secrets-manager.sh # AWS-substitute compatibility test
+├── bin/ensure-app-credentials.py # scoped read-only app credential + override
 ├── bin/deploy-discovery.sh       # generic read-only deployment inventory
 ├── deploy/nginx/                 # host nginx edge config + runbook
 ├── docs/                         # client integration + production runbook
@@ -760,6 +809,7 @@ npm run build
 ├── Dockerfile.password.prd
 ├── .env.example                  # canonical reference (all 33 variables)
 ├── .env.dev / .env.prd         # local runtime, git-ignored
+├── .run/                         # generated app credential, git-ignored
 ├── password_generator.py
 ├── eff_short_wordlist_1.txt
 └── backups/<env>/                # generated, git-ignored
@@ -773,6 +823,17 @@ npm run build
   never stored, logged or sent to a third party.
 - The Secrets Manager binds to `127.0.0.1` in both profiles. Do not publish it
   to the internet; use a private network and rotate the local credentials.
+- The app runs with an auto-generated, prefix-scoped, read-only client. The
+  full-access instance credential stays in the Secrets Manager container and in
+  host tooling; a compromised app cannot mint credentials or modify secrets.
+- `CreateClientCredential`, `GetClientCredential`, `ListClientCredentials` and
+  `DeleteClientCredential` are served only on the container-loopback admin
+  listener. The public listener returns `AccessDeniedException` and the nginx
+  edge returns `403`, regardless of the credential presented.
+- `.run/app-credentials.<env>.json` and `.run/compose.app-credentials.<env>.yml`
+  contain a client secret. On POSIX filesystems they are mode `600` inside a
+  mode `700` directory. exFAT/NTFS mounts ignore modes; restrict the host path
+  or use a POSIX filesystem.
 - In production only the host nginx is public (TCP 80/443). It terminates TLS,
   adds HSTS and security headers, and proxies to the loopback app/Secrets
   Manager ports while preserving `Host` and path for SigV4.

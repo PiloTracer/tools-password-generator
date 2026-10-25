@@ -48,7 +48,10 @@ async function main() {
   }
   const wordlistSha256 = crypto.createHash("sha256").update(wordlistBytes).digest("hex");
 
-  const rateLimit = environment === "prd" ? 120 : 240;
+  // Seeded throttle: prd matches the app default and sits below the edge limit
+  // (20 r/m + burst 10), so the edge is the first line and this is the backstop.
+  // dev is looser to keep local iteration and smoke runs frictionless.
+  const rateLimit = environment === "prd" ? 30 : 120;
   const now = new Date().toISOString();
   const configSecretId = String(
     process.env.SEED_CONFIG_SECRET_ID || `${prefix}/app-config`,

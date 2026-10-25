@@ -106,6 +106,7 @@ export class SecretStore {
           allowedPrefixes: Array.isArray(client.allowedPrefixes)
             ? client.allowedPrefixes.map(String)
             : [],
+          readOnly: client.readOnly === true || String(client.readOnly || "").trim().toLowerCase() === "true",
         }))
       : [];
     this.reservedAccessKeyIds = new Set([
@@ -306,6 +307,7 @@ export class SecretStore {
         sessionToken: "",
         name: client.name,
         admin: false,
+        readOnly: false,
         allowedPrefixes: [...client.allowedPrefixes],
       });
       knownAccessKeyIds.add(client.accessKeyId);
@@ -348,6 +350,7 @@ export class SecretStore {
       AccessKeyId: record.accessKeyId,
       Description: record.description || "",
       AllowedPrefixes: [...record.allowedPrefixes],
+      ReadOnly: source === "static" ? Boolean(record.readOnly) : false,
       Source: source,
     };
     if (source === "managed") {
@@ -597,6 +600,7 @@ export class SecretStore {
       sessionToken: "",
       name,
       admin: false,
+      readOnly: false,
       allowedPrefixes: [...allowedPrefixes],
     });
     return {

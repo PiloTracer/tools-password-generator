@@ -3,6 +3,7 @@ import http from "node:http";
 
 import {
   AwsError,
+  accessDenied,
   internalError,
   invalidRequest,
   serializationError,
@@ -15,6 +16,17 @@ import { SecretStore } from "./lib/store.mjs";
 
 const VERSION = "1.1.0";
 const MAX_BODY_BYTES = 1024 * 1024;
+
+const CLIENT_CREDENTIAL_OPERATIONS = new Set([
+  "CreateClientCredential",
+  "DeleteClientCredential",
+  "GetClientCredential",
+  "ListClientCredentials",
+]);
+
+function isClientCredentialOperation(operation) {
+  return CLIENT_CREDENTIAL_OPERATIONS.has(operation);
+}
 const MAX_CLIENT_DESCRIPTION_LENGTH = 512;
 
 /**
@@ -95,6 +107,10 @@ function parseClientCredentials(raw, primaryAccessKeyId) {
       }
     }
 
+    const readOnly =
+      entry.readOnly === true ||
+      String(entry.readOnly || "").trim().toLowerCase() === "true";
+
     return {
       accessKeyId,
       secretAccessKey,
@@ -102,6 +118,7 @@ function parseClientCredentials(raw, primaryAccessKeyId) {
       name,
       description,
       admin: false,
+      readOnly,
       allowedPrefixes,
     };
   });
@@ -136,6 +153,7 @@ function loadConfig(env) {
           sessionToken,
           name: "instance-admin",
           admin: true,
+          readOnly: false,
           allowedPrefixes: [],
         }]
       : []),
@@ -145,6 +163,19 @@ function loadConfig(env) {
   const port = Number.parseInt(env.SM_PORT || "8080", 10);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("SM_PORT must be a valid TCP port.");
+  }
+
+  const adminHost = String(env.SM_ADMIN_HOST || "127.0.0.1").trim();
+  if (!["127.0.0.1", "::1", "localhost"].includes(adminHost)) {
+    throw new Error("SM_ADMIN_HOST must be a loopback address (127.0.0.1, ::1 or localhost).");
+  }
+
+  const adminPort = Number.parseInt(env.SM_ADMIN_PORT || "8081", 10);
+  if (!Number.isInteger(adminPort) || adminPort < 1 || adminPort > 65535) {
+    throw new Error("SM_ADMIN_PORT must be a valid TCP port.");
+  }
+  if (adminPort === port) {
+    throw new Error("SM_ADMIN_PORT must differ from SM_PORT.");
   }
 
   const region = String(env.SM_REGION || env.AWS_REGION || "us-east-1").trim();
@@ -175,6 +206,8 @@ function loadConfig(env) {
   return {
     port,
     host: env.SM_HOST || "0.0.0.0",
+    adminHost,
+    adminPort,
     region,
     accountId,
     accessKeyId,
@@ -261,8 +294,11 @@ function readBody(req) {
           "The request body is too large.",
           413,
         );
+        // Drain instead of destroying the socket. `req.destroy()` raced the
+        // error response, so callers observed ECONNRESET rather than the
+        // intended HTTP 413 (contract defect D1).
+        req.resume();
         reject(error);
-        req.destroy();
         return;
       }
       chunks.push(chunk);
@@ -380,7 +416,7 @@ function main() {
    * @param {http.IncomingMessage} req
    * @param {http.ServerResponse} res
    */
-  async function handle(req, res) {
+  async function handle(req, res, isAdminListener = false) {
     const requestId = crypto.randomUUID();
     const started = Date.now();
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -404,10 +440,18 @@ function main() {
 
       if (req.method === "GET" && url.pathname === "/readyz") {
         const health = store.health();
+        // The public readiness probe answers "can I serve traffic?" only.
+        // Secret counts, the data directory and the master-key source are
+        // operational internals: keep them on the loopback admin listener so an
+        // unauthenticated internet caller cannot fingerprint the store
+        // (feedback F-06). HTTP status semantics are unchanged (BC6).
+        const payload = isAdminListener
+          ? { status: health.ok ? "ready" : "not_ready", ...health }
+          : { status: health.ok ? "ready" : "not_ready", ok: health.ok, version: VERSION };
         return sendJson(
           res,
           health.ok ? 200 : 503,
-          { status: health.ok ? "ready" : "not_ready", ...health },
+          payload,
           { "x-amzn-RequestId": requestId },
           "application/json",
         );
@@ -424,7 +468,9 @@ function main() {
             version: VERSION,
             region: config.region,
             authRequired: config.requireAuth,
-            operations: SUPPORTED_OPERATIONS,
+            operations: isAdminListener
+              ? SUPPORTED_OPERATIONS
+              : SUPPORTED_OPERATIONS.filter((op) => !isClientCredentialOperation(op)),
             health: ["/healthz", "/readyz"],
           },
           { "x-amzn-RequestId": requestId },
@@ -486,6 +532,12 @@ function main() {
         throw unknownOperation(target);
       }
 
+      if (!isAdminListener && isClientCredentialOperation(operation)) {
+        throw accessDenied(
+          "Client credential management is only available on the local admin listener.",
+        );
+      }
+
       const result = dispatch(operation, payload, store, principal);
       logger.debug("request completed", {
         requestId,
@@ -515,22 +567,45 @@ function main() {
     }
   }
 
-  const server = http.createServer((req, res) => {
-    handle(req, res).catch((error) => {
-      logger.error("fatal handler error", {
+  function createServer(isAdminListener) {
+    const instance = http.createServer((req, res) => {
+      handle(req, res, isAdminListener).catch((error) => {
+        logger.error("fatal handler error", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (!res.headersSent) {
+          sendJson(res, 500, { __type: "InternalServiceError", message: "Internal error." });
+        } else {
+          res.end();
+        }
+      });
+    });
+    instance.keepAliveTimeout = 65000;
+    instance.headersTimeout = 66000;
+    instance.requestTimeout = 30000;
+    return instance;
+  }
+
+  const server = createServer(false);
+  const adminServer = createServer(true);
+
+  /**
+   * Fail fast with an actionable log entry rather than crashing with an
+   * unhandled 'error' event when a listener cannot bind.
+   *
+   * @param {string} listener
+   */
+  function listenerError(listener) {
+    return (error) => {
+      logger.error("listener failed", {
+        listener,
         error: error instanceof Error ? error.message : String(error),
       });
-      if (!res.headersSent) {
-        sendJson(res, 500, { __type: "InternalServiceError", message: "Internal error." });
-      } else {
-        res.end();
-      }
-    });
-  });
-
-  server.keepAliveTimeout = 65000;
-  server.headersTimeout = 66000;
-  server.requestTimeout = 30000;
+      process.exit(1);
+    };
+  }
+  server.on("error", listenerError("public"));
+  adminServer.on("error", listenerError("admin"));
 
   server.listen(config.port, config.host, () => {
     logger.info("secrets manager listening", {
@@ -546,9 +621,21 @@ function main() {
     });
   });
 
+  adminServer.listen(config.adminPort, config.adminHost, () => {
+    logger.info("secrets manager admin listener listening", {
+      version: VERSION,
+      host: config.adminHost,
+      port: config.adminPort,
+      region: config.region,
+      adminOnly: true,
+    });
+  });
+
   function shutdown(signal) {
     logger.info("shutting down", { signal });
-    server.close(() => process.exit(0));
+    server.close(() => {
+      adminServer.close(() => process.exit(0));
+    });
     setTimeout(() => process.exit(0), 5000).unref();
   }
 

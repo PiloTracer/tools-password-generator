@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
+
+import { releaseSlot, tryAcquireSlot } from "./concurrency";
 import { existsSync } from "node:fs";
 import { access } from "node:fs/promises";
 import path from "node:path";
@@ -17,7 +19,35 @@ export type GeneratorHealth = {
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const HEALTH_CACHE_MS = 60_000;
 
+/**
+ * Environment variables the Python child may inherit.
+ *
+ * The parent holds the Secrets Manager credential. Passing it — or PYTHONPATH /
+ * PYTHONSTARTUP, both of which can inject code — into the most exposed
+ * subprocess turns an interpreter quirk into a credential leak.
+ */
+const INHERITED_ENV_KEYS = ["PATH", "LANG", "LC_ALL", "TZ", "HOME", "SYSTEMROOT"] as const;
+
+function childEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    // Node's ProcessEnv type declares NODE_ENV as required; it is not a secret
+    // and the Python child ignores it.
+    NODE_ENV: process.env.NODE_ENV ?? "production",
+  };
+  for (const key of INHERITED_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+  env.PYTHONUNBUFFERED = "1";
+  env.PYTHONIOENCODING = "utf-8";
+  env.PYTHONDONTWRITEBYTECODE = "1";
+  return env;
+}
+
 let healthCache: { value: GeneratorHealth; expiresAt: number } | null = null;
+let healthInflight: Promise<GeneratorHealth> | null = null;
 
 /**
  * The Python interpreter to execute. Inside the images `python3` is always
@@ -86,6 +116,14 @@ export async function runGenerator(
 
   const python = resolvePythonBin();
 
+  if (!tryAcquireSlot()) {
+    return {
+      ok: false,
+      code: "BUSY",
+      message: "The generator is at capacity. Please retry in a moment.",
+    };
+  }
+
   return new Promise<GeneratorRunResult>((resolve) => {
     let settled = false;
     let guard: ReturnType<typeof setTimeout> | undefined;
@@ -95,6 +133,7 @@ export async function runGenerator(
         return;
       }
       settled = true;
+      releaseSlot();
       if (guard) {
         clearTimeout(guard);
       }
@@ -104,12 +143,7 @@ export async function runGenerator(
     try {
       const child: ChildProcess = spawn(python, [script, "--non-interactive", ...args], {
         stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          PYTHONUNBUFFERED: "1",
-          PYTHONIOENCODING: "utf-8",
-          PYTHONDONTWRITEBYTECODE: "1",
-        },
+        env: childEnv(),
         timeout: timeoutMs,
         killSignal: "SIGKILL",
         windowsHide: true,
@@ -212,16 +246,31 @@ async function probeGenerator(): Promise<GeneratorHealth> {
     };
 
     try {
-      const child = spawn(python, ["--version"], {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      });
+      // Exercise a REAL generation, not just `python --version`. A broken
+      // script, a bad flag or a missing interpreter previously left the probe
+      // green while every request returned 500.
+      const child = spawn(
+        python,
+        [
+          script,
+          "--non-interactive",
+          "--length",
+          "16",
+          "--special-count",
+          "2",
+          "--digit-count",
+          "2",
+          "--mixed-case-count",
+          "4",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"], env: childEnv(), windowsHide: true },
+      );
 
       let output = "";
       guard = setTimeout(() => {
         child.kill("SIGKILL");
-        settle({ ok: false, python, script, error: "python --version timed out." });
-      }, 3_000);
+        settle({ ok: false, python, script, error: "The generator probe timed out." });
+      }, 5_000);
 
       child.stdout?.on("data", (chunk: Buffer) => {
         output += chunk.toString("utf8");
@@ -233,16 +282,26 @@ async function probeGenerator(): Promise<GeneratorHealth> {
         settle({ ok: false, python, script, error: error.message });
       });
       child.on("close", (code) => {
-        if (code === 0) {
-          settle({ ok: true, python, script });
-        } else {
+        if (code !== 0) {
           settle({
             ok: false,
             python,
             script,
-            error: output.trim() || `Python exited with code ${code}.`,
+            error: output.trim() || `The generator exited with code ${code}.`,
           });
+          return;
         }
+        const produced = output.trim().split(/\r?\n/).filter((line) => line.length > 0).pop() ?? "";
+        if (produced.length !== 16 || !/^[\x21-\x7e]+$/.test(produced)) {
+          settle({
+            ok: false,
+            python,
+            script,
+            error: "The generator probe did not return a usable value.",
+          });
+          return;
+        }
+        settle({ ok: true, python, script });
       });
     } catch (error) {
       settle({
@@ -263,11 +322,23 @@ export async function checkGeneratorHealth(): Promise<GeneratorHealth> {
   if (healthCache && healthCache.expiresAt > Date.now()) {
     return healthCache.value;
   }
-  const value = await probeGenerator();
-  healthCache = { value, expiresAt: Date.now() + HEALTH_CACHE_MS };
-  return value;
+  // Single-flight: a burst of health/readiness probes must not fan out into one
+  // Python process each.
+  if (healthInflight) {
+    return healthInflight;
+  }
+  healthInflight = probeGenerator()
+    .then((value) => {
+      healthCache = { value, expiresAt: Date.now() + HEALTH_CACHE_MS };
+      return value;
+    })
+    .finally(() => {
+      healthInflight = null;
+    });
+  return healthInflight;
 }
 
 export function resetGeneratorHealthCache(): void {
   healthCache = null;
+  healthInflight = null;
 }

@@ -77,6 +77,15 @@ Start the stack:
 nginx configuration must contain `server_name` for both names. It then waits for
 the public HTTPS endpoints through nginx.
 
+The installed config also blocks the four `*ClientCredential` operations on the
+public edge. Reload nginx after every update to
+`deploy/nginx/agiolab.conf`:
+
+```bash
+sudo cp deploy/nginx/agiolab.conf /etc/nginx/conf.d/agiolab.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
 ## DNS and firewall
 
 Create A/AAAA records for `agiolab.com`, `www.agiolab.com`,

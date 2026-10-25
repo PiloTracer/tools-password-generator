@@ -1,10 +1,10 @@
 "use client";
 
-import { FormEvent, useMemo, useState, useEffect } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { QRCodeSVG } from "qrcode.react";
 import zxcvbn from "zxcvbn";
-import { Copy, Check, RefreshCw, History, Download, QrCode, X, AlertTriangle } from "lucide-react";
+import { Copy, Check, RefreshCw, History, Download, QrCode, AlertTriangle } from "lucide-react";
 import clsx from "clsx";
 import { twMerge } from "tailwind-merge";
 
@@ -243,6 +243,13 @@ export function PasswordGeneratorForm() {
           </button>
         </div>
       </header>
+
+      {/* Screen-reader announcement: report the event, never the secret. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {generatedPassword
+          ? `New password generated, ${generatedPassword.length} characters.`
+          : ""}
+      </div>
 
       <form className="grid gap-8" onSubmit={handleSubmit}>
         <AnimatePresence mode="wait">
@@ -613,6 +620,7 @@ export function PasswordGeneratorForm() {
 
         {errorMessage ? (
           <motion.div
+            role="alert"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             className="rounded-2xl bg-rose-50 p-4 text-sm text-rose-600 dark:bg-rose-900/40 dark:text-rose-200 flex items-center gap-2"

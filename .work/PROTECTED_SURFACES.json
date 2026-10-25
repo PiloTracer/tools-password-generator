@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "description": "Machine-readable high-blast paths for this consumer project. Customize for your repository; framework defaults live in the Agent OS source at standards/PROTECTED_SURFACES.json ($AGENT_OS_SOURCE/standards/ when thin-client).",
+  "rule": "fail_verify_without_owner_approval",
+  "paths": [
+    "package.json",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "poetry.lock",
+    "pyproject.toml",
+    "docker-compose.yml",
+    "docker-compose.dev.yml",
+    "docker-compose.prd.yml",
+    "Dockerfile",
+    "Dockerfile.dev",
+    ".github/workflows/ci.yml",
+    ".github/workflows/deploy.yml",
+    ".cursorrules",
+    "AGENTS.md",
+    "password/package.json",
+    "password/package-lock.json",
+    "password/next.config.ts",
+    "password/eslint.config.mjs",
+    "password/postcss.config.mjs",
+    "secrets-manager/Dockerfile",
+    "secrets-manager/openapi.yaml",
+    "secrets-manager/lib/store.mjs",
+    "Dockerfile.password.dev",
+    "Dockerfile.password.prd",
+    "bin/start.sh",
+    "deploy/nginx/agiolab.conf",
+    "eff_short_wordlist_1.txt"
+  ],
+  "patterns": [
+    "*.env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "migrations/*.sql",
+    "**/secrets/**",
+    "backups/**",
+    ".run/**"
+  ],
+  "thresholds": {
+    "max_lines_warn": 150,
+    "max_lines_fail": 400,
+    "max_areas_warn": 2,
+    "max_areas_fail": 3
+  }
+}

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import secrets
 import string
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -522,8 +523,11 @@ def main() -> None:
         print("\nAborted.")
         return
     except ValueError as exc:
-        print(f"\nError: {exc}")
-        return
+        # Exit non-zero. Callers (the HTTP API, scripts, future SDKs) rely on
+        # the status code; printing "Error: ..." with exit 0 previously let an
+        # error page pass for a generated password.
+        print(f"\nError: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
     print("\nPassword configuration:")
     print(f"  Use words: {'Yes' if config.use_words else 'No'}")
@@ -546,7 +550,14 @@ def main() -> None:
         print(f"  Lowercase filler characters: {max(0, filler)}")
 
     if config.use_words:
-        words = load_wordlist(config.wordlist_path)
+        try:
+            words = load_wordlist(config.wordlist_path)
+        except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+            # An explicitly requested word list that cannot be used is a hard
+            # failure. Falling back to the bundled list would silently change
+            # the entropy of a passphrase the caller believes is Diceware.
+            print(f"\nError: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
         password = generate_passphrase(
             word_count=config.word_count,
             words=words,

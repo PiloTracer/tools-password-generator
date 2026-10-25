@@ -1,15 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Moon, Sun } from "lucide-react";
 
+// The `dark` class is only ever set by this toggle; nothing applies it at boot
+// (see globals.css, which uses a prefers-color-scheme media query instead). So
+// "light" is the correct initial state and no mount-time read of the DOM is
+// needed.
 export function ThemeToggle() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
-
-  useEffect(() => {
-    const isDark = document.documentElement.classList.contains("dark");
-    setTheme(isDark ? "dark" : "light");
-  }, []);
 
   function toggleTheme() {
     const newTheme = theme === "light" ? "dark" : "light";

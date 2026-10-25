@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 
-import { runGenerator } from "@/lib/generator";
+import { resolveWordlistPath, runGenerator } from "@/lib/generator";
 import { checkRateLimit } from "@/lib/rate-limit";
 import { getRuntimeConfig } from "@/lib/runtime-config";
 import { verifyWordlist } from "@/lib/wordlist";
@@ -10,6 +10,40 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const SAFE_SEPARATOR_REGEX = /^[\w\-_.:|~]{0,5}$/;
+
+/** Upper bound for a generate request. The real payload is a few hundred bytes. */
+const MAX_BODY_BYTES = 16 * 1024;
+
+/**
+ * Reject callers that are not same-origin JSON clients.
+ *
+ * Without this, any web page can POST `text/plain` JSON cross-site (a "simple"
+ * request, so no CORS preflight), which makes every visitor's browser a
+ * distinct-IP client and turns the IP limiter into a formality.
+ *
+ * @returns an error message, or null when the request is acceptable.
+ */
+function crossSiteRejection(request: NextRequest): string | null {
+  const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.startsWith("application/json")) {
+    return "Requests must use the application/json content type.";
+  }
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+    return "Cross-site requests are not allowed.";
+  }
+  const origin = request.headers.get("origin");
+  if (origin) {
+    try {
+      if (new URL(origin).host !== request.headers.get("host")) {
+        return "Cross-site requests are not allowed.";
+      }
+    } catch {
+      return "Cross-site requests are not allowed.";
+    }
+  }
+  return null;
+}
 
 function toInteger(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isInteger(value)) {
@@ -53,22 +87,44 @@ function sanitizeSeparator(value: unknown): string {
   if (!trimmed) {
     return "-";
   }
+  // A leading "-" would be parsed by argparse as an option flag, so the CLI
+  // exits 2 with a usage dump. Reject it here instead of returning a 500.
+  if (trimmed.startsWith("-")) {
+    return "-";
+  }
   if (!SAFE_SEPARATOR_REGEX.test(trimmed)) {
     return "-";
   }
   return trimmed;
 }
 
+/**
+ * Derive the rate-limit bucket key from the caller's address.
+ *
+ * The edge nginx is the only ingress and sets `X-Real-IP` from `$remote_addr`,
+ * which the client cannot influence. `X-Forwarded-For` is appended to
+ * (`$proxy_add_x_forwarded_for`), so its *first* entry is caller-controlled and
+ * must never be trusted — trusting it let a client choose its own bucket and
+ * bypass throttling. Prefer `X-Real-IP`, then the last hop that a trusted proxy
+ * actually appended.
+ */
 function clientKey(request: NextRequest): string {
+  const realIp = request.headers.get("x-real-ip")?.trim();
+  if (realIp) {
+    return realIp;
+  }
   const forwarded = request.headers.get("x-forwarded-for");
   if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) {
-      return first;
+    const hops = forwarded
+      .split(",")
+      .map((hop) => hop.trim())
+      .filter(Boolean);
+    const lastHop = hops[hops.length - 1];
+    if (lastHop) {
+      return lastHop;
     }
   }
-  const realIp = request.headers.get("x-real-ip")?.trim();
-  return realIp || "unknown";
+  return "unknown";
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
@@ -101,9 +157,23 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
+  const crossSite = crossSiteRejection(request);
+  if (crossSite) {
+    return respond({ error: crossSite }, 403);
+  }
+
+  const declaredLength = Number.parseInt(request.headers.get("content-length") ?? "", 10);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
+    return respond({ error: "Request body is too large." }, 413);
+  }
+
   let payload: Record<string, unknown>;
   try {
-    const parsed: unknown = await request.json();
+    const raw = await request.text();
+    if (raw.length > MAX_BODY_BYTES) {
+      return respond({ error: "Request body is too large." }, 413);
+    }
+    const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       return respond({ error: "Invalid JSON body." }, 400);
     }
@@ -189,6 +259,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     args.push(
       "--use-words",
+      // Pass the same file whose digest was verified. Without this the CLI
+      // resolves the list relative to its own location and silently falls back
+      // to a 54-word inline list, which would change the passphrase entropy.
+      "--wordlist",
+      resolveWordlistPath(),
       "--word-count",
       String(wordCount),
       "--word-separator",
@@ -225,6 +300,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   const result = await runGenerator(args, 10_000);
   if (!result.ok) {
+    if (result.code === "BUSY") {
+      return respond(
+        { error: "The service is busy. Please retry in a moment." },
+        503,
+        { "Retry-After": "2" },
+      );
+    }
     console.error("[generate] generator failure", {
       code: result.code,
       message: result.message,
